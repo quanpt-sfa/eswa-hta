@@ -13,8 +13,8 @@ project:
 random_seeds:
   model_seed: 42
   tabicl_variance_seeds: [42, 43, 44]
-  bootstrap_seed: 42
-  bootstrap_replications: 1000
+  bootstrap_seed: 20261024
+  bootstrap_replications: 2000
   confidence_level: 0.95
 
 temporal_windows:
@@ -45,22 +45,22 @@ feature_sets:
 
 models:
   primary_claim:
-    proposed_model: "M1"         # TabICL hurdle model (classifier on is_zero_adj + TabICL regressor)
-    primary_benchmark: "B3a"     # CatBoost MultiQuantile with X2
+    proposed_model: "M1"             # Exactly B8: Hurdle-TabICLv2
+    primary_benchmark: "B3a"         # Threshold-informed CatBoost binary classifier
     primary_metric: "Average Precision at k=0.05"
     evaluation_test: "paired_firm_cluster_bootstrap"
   registered_suite:
-    B1: { family: "CatBoost", objective: "PointRegression", features: "X1" }
-    B2: { family: "TabICL", objective: "DirectQuantileRegression", features: "X2" }
-    B3a: { family: "CatBoost", objective: "MultiQuantile", features: "X2", grid_levels: 99 }
-    B3b: { family: "CatBoost", objective: "PointRegression", features: "X2" }
-    B4: { family: "NGBoost", objective: "ParametricDistribution", distributions: ["Normal", "Laplace", "TFixedDf"] }
-    B5: { family: "CatBoost", objective: "BinaryClassification", target: "y_k050", features: "X2" }
-    B6: { family: "TabICL", objective: "BinaryClassification", target: "y_k050", features: "X2" }
-    B7: { family: "CatBoostHurdle", zero_part: "CatBoostClassifier", nonzero_part: "CatBoostMQ" }
-    B8: { family: "CatBoostHurdleEnsemble", zero_part: "CatBoostClassifier", nonzero_part: "CatBoostMQ" }
-    M0: { family: "TabICL", objective: "QuantileRegression", features: "X2" }
-    M1: { family: "TabICL", objective: "HurdleMixture", zero_part: "TabICLClassifier", nonzero_part: "TabICLRegressor", features: "X2" }
+    B1: { family: "CatBoost", objective: "BinaryClassification", target: "y_k050", features: "X1" }
+    B2: { family: "TabICL", objective: "BinaryClassification", target: "y_k050", features: "X2" }
+    B3a: { family: "CatBoost", objective: "BinaryClassification", target: "y_k050", features: "X2" }
+    B3b: { family: "CatBoost", objective: "ThresholdConditionedBinaryClassification", target: "y_at_k", features: "X2 - c_k050 + {k,c_k}" }
+    B4: { family: "NGBoost", objective: "ParametricDistributionalRegression", target: "D", features: "X2", distributions: ["Normal", "Laplace", "TFixedDf"] }
+    B5: { family: "CatBoost", objective: "MultiQuantileRegression", target: "D", features: "X2", grid_levels: 99 }
+    B6: { family: "TabICL", objective: "DistributionalQuantileRegression", target: "D", features: "X2" }
+    B7: { family: "CatBoostHurdle", zero_part: "CatBoostClassifier", nonzero_part: "CatBoostMultiQuantile", features: "X2" }
+    B8: { family: "TabICLHurdle", zero_part: "TabICLClassifier", nonzero_part: "TabICLRegressor", features: "X2" }
+    M0: { alias_for: "B6" }
+    M1: { alias_for: "B8" }
 
 quantile_grids:
   catboost_multiquantile:
