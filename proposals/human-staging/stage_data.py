@@ -51,15 +51,19 @@ def compute_sha256(filepath: Path) -> str:
 
 
 def audit_test_features_sanitization(df: pd.DataFrame) -> List[str]:
-    """Returns any forbidden outcome or target-derived columns found in dataframe."""
+    """Fail-closed vocabulary scan; explicit human allowlist is also required."""
     found = []
-    cols_lower = [c.lower() for c in df.columns]
-    for pattern in FORBIDDEN_OUTCOME_COLUMNS:
-        pattern_lower = pattern.lower()
-        for col in df.columns:
-            if pattern_lower == col.lower() or col.lower().startswith("y_k") or col.lower().startswith("delta"):
-                if col not in found:
-                    found.append(col)
+    forbidden_exact = {name.lower() for name in FORBIDDEN_OUTCOME_COLUMNS}
+    forbidden_prefixes = (
+        "fs_aud_", "audit_adj_", "audit_adjustment_", "delta",
+        "y_k", "post_audit_", "audited_",
+    )
+    forbidden_suffixes = ("_post", "_aud", "_audited")
+    for col in df.columns:
+        name = str(col).lower()
+        if (name in forbidden_exact or name.startswith(forbidden_prefixes)
+                or name.endswith(forbidden_suffixes)):
+            found.append(col)
     return found
 
 
@@ -71,7 +75,8 @@ def stage_holdout_data(
     receipt_path: Path,
     manifest_path: Path,
     dev_max_year: int = 2022,
-    test_min_year: int = 2023
+    test_min_year: int = 2023,
+    approved_test_feature_columns: List[str] = None,
 ) -> Tuple[str, str, str]:
     """
     Executes physical holdout separation and writes verification metadata.
@@ -85,6 +90,26 @@ def stage_holdout_data(
     for k in REQUIRED_KEYS:
         if k not in df.columns:
             raise KeyError(f"Required key '{k}' missing from master dataset")
+
+    # Must be explicitly approved by the human data steward. A denylist alone
+    # cannot identify unknown target-derived source columns (fs_aud_*, etc.).
+    if not approved_test_feature_columns:
+        raise ValueError("Human-approved test-feature column allowlist is required")
+    allowed = list(approved_test_feature_columns)
+    if len(set(allowed)) != len(allowed):
+        raise ValueError("Duplicate entries in approved feature allowlist")
+    if not set(REQUIRED_KEYS).issubset(allowed):
+        raise ValueError("Approved allowlist must include all required keys")
+    missing = sorted(set(allowed) - set(df.columns))
+    if missing:
+        raise ValueError(f"Approved columns absent from source: {missing}")
+    forbidden = audit_test_features_sanitization(pd.DataFrame(columns=allowed))
+    if forbidden:
+        raise ValueError(f"Forbidden output columns in approved allowlist: {forbidden}")
+    if output_sealed_outcomes_path.resolve() == output_test_features_path.resolve():
+        raise ValueError("Sealed outcomes and released test features must have different paths")
+    if output_sealed_outcomes_path.resolve() == output_dev_path.resolve():
+        raise ValueError("Sealed outcomes and development data must have different paths")
 
     # 1. Development Split (FY <= dev_max_year)
     dev_df = df[df["fiscal_year"] <= dev_max_year].copy()
@@ -103,8 +128,7 @@ def stage_holdout_data(
     sealed_hash = compute_sha256(output_sealed_outcomes_path)
 
     # 4. Sanitized Test Features (Remove all outcomes)
-    feature_cols = [c for c in test_raw.columns if c not in FORBIDDEN_OUTCOME_COLUMNS and not c.startswith("y_k")]
-    test_features_df = test_raw[feature_cols].copy()
+    test_features_df = test_raw[allowed].copy()
 
     # Redaction assertion
     violations = audit_test_features_sanitization(test_features_df)
@@ -146,7 +170,7 @@ Master Source: {master_path.name}
    - Rows: {len(sealed_df)}
    - SHA-256: {sealed_hash}
 
-Status: STAGED_AND_VERIFIED
+Status: STAGING_OUTPUTS_CREATED__ACCESS_ISOLATION_UNVERIFIED\nHuman sign-off required after permission-denial probe.
 """
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     with open(receipt_path, "w", encoding="utf-8") as f:
@@ -163,6 +187,8 @@ if __name__ == "__main__":
     parser.add_argument("--out-sealed", required=True, type=Path, help="Destination for sealed test outcomes")
     parser.add_argument("--receipt", required=True, type=Path, help="Destination for staged_holdout_receipt.md")
     parser.add_argument("--manifest", required=True, type=Path, help="Destination for input_manifest.sha256")
+    parser.add_argument("--allowlist", required=True, type=Path,
+                        help="Human-approved UTF-8 text file: one canonical test feature column per line")
 
     args = parser.parse_args()
     try:
@@ -172,7 +198,11 @@ if __name__ == "__main__":
             output_test_features_path=args.out_test_features,
             output_sealed_outcomes_path=args.out_sealed,
             receipt_path=args.receipt,
-            manifest_path=args.manifest
+            manifest_path=args.manifest,
+            approved_test_feature_columns=[
+                x.strip() for x in args.allowlist.read_text(encoding="utf-8").splitlines()
+                if x.strip() and not x.strip().startswith("#")
+            ],
         )
         print("Holdout staging completed successfully.")
     except Exception as e:
