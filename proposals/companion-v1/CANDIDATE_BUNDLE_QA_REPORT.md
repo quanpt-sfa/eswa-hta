@@ -3,25 +3,25 @@
 
 **Document:** `proposals/companion-v1/CANDIDATE_BUNDLE_QA_REPORT.md`  
 **Date:** 2026-10-24  
-**Author:** Coding & QA Agent (Repair Confirmed Implementation Defects)  
-**Working Branch:** `fix/candidate-code-defects-and-workload-verification`  
-**Base Commit:** `fcbcf5f1f5532d8d53f5f4d0e0bda408a48b9b98`  
+**Author:** Coding & QA Agent (Final Targeted Repair — False-PASS Elimination)  
+**Working Branch:** `fix/final-false-pass-repair`  
+**Base Commit:** `01554335c1b3e083c953f58db7eced63b1e758ed`  
 **Target Proposal:** `proposals/companion-v1/` and `proposals/human-staging/`  
-**Status:** `CANDIDATE_QA_PASSED_PENDING_EXTERNAL_APPROVAL` (70/70 Unit & Adversarial Tests PASSED; G0 Preflight STOP_BLOCKER)
+**Status:** `CANDIDATE_QA_PASSED_PENDING_EXTERNAL_APPROVAL` (130/130 Unit & Adversarial Tests PASSED; G0 Preflight STOP_BLOCKER)
 
 ---
 
 ## 1. Test Suite Summary (Executed Full Suite)
 
-- **Previous Baseline:** 64 passed
-- **New Tests / Assertions Added:** +6 tests (+22 assertions)
-  - `test_api_preflight.py`: +6 tests (now 16 passed, covering GPU OOM, memory limits, geometry validation, checkpoint linkage, mock labeling, and CLI exit codes)
-  - `test_hta_ref.py`: 26 passed (+4 regression assertion groups covering Defect B: `fixed_assets_pre`, `dividend_pre`, `debt_pre`, outcome features, and fail-closed cutoffs)
+- **Previous Baseline:** 70 passed
+- **New Tests / Assertions Added:** +60 tests (+145 assertions)
+  - `test_api_preflight.py`: +46 tests (expanded from 16 to 62 passed, covering mock execution blocking, two-model checkpoint identity via `model_path_` and hash, strict workload schema without arbitrary defaults, GPU peak VRAM recording, and aggregation invariants)
+  - `test_hta_ref.py`: +14 tests (expanded from 26 to 40 passed, covering separation of declared provenance from verified source lineage, $c_{k050}$ deterministic validator with independent recomputation, units/scope/stage validation, historical lag lineage verification, and boundary-token scanner)
   - `test_staging.py`: 20 passed
   - `test_protocol_contract.py`: 3 passed
   - `test_fixture_schema.py`: 5 passed
-- **Final Collected Tests:** 70
-- **Passed:** 70
+- **Final Collected Tests:** 130
+- **Passed:** 130
 - **Failed:** 0
 - **Skipped:** 0
 - **Overall Exit Code:** 0
@@ -168,3 +168,63 @@ python -m pytest proposals/ -v
      - Strictly verified $c_{k050}$ lineage: requires `temporal_status: "t_pre"`, approved pre-audit sources (`pat_pre`, `total_assets_pre`), and verified pre-audit formula.
    - **Regression tests:** Added 4 regression assertion suites in `test_hta_ref.py` explicitly asserting that `fixed_assets_pre`, `dividend_pre`, `debt_pre` pass, outcome variables fail closed, missing cutoffs fail closed, and $c_{k075}$ is rejected.
 
+---
+
+## 5. Final Targeted Repair — False-PASS Vulnerability Elimination (Patches 1 to 7)
+
+### 5.1 Patch 1: Mock Execution Invariants and Overall Aggregation Rules
+- **Defective behavior:** Previous aggregation allowed `all(status == "PASSED")` to assign overall `ALL_PROBES_PASSED` even when models were mocked, running on synthetic runners, or lacking verified artifact identity.
+- **Remediation:**
+  - Mock execution can only ever attain `MOCK_ORCHESTRATION_PASSED` with `evidence_type: "MOCK_ORCHESTRATION_ONLY"` and `mocked: True`.
+  - Overall aggregation (`aggregate_overall_status` in `api_preflight.py`) validates deep evidence fields (`mocked is False`, `evidence_type == "REAL_EXECUTION"`, `loaded_checkpoint_verified is True`, and `workload_configuration_verified is True`).
+  - Rule: Any component `FAILED` -> `PROBES_FAILED`. Any required component `BLOCKED` or using mocks or unverified checkpoints -> `BLOCKED`. Inconsistent evidence claims -> `BLOCKED_INCONSISTENT_EVIDENCE`.
+  - Logical invariant strictly maintained: `report["status"] == "ALL_PROBES_PASSED"` implies real, non-mocked execution of all mandatory engines, verified checkpoints, and verified registered GPU workload.
+
+### 5.2 Patch 2: Independent Dual-Checkpoint Verification & `model_path_` Introspection
+- **Defective behavior:** A single checkpoint was self-declared as loaded by TabICL without introspecting post-fit attributes, and was shared between the Regressor and Classifier.
+- **Remediation:**
+  - Separate CLI arguments for both M1/B8 model components: `--regressor-checkpoint`, `--regressor-sha256`, `--classifier-checkpoint`, `--classifier-sha256`. Older single-checkpoint flags are explicitly deprecated for the regressor only with a warning.
+  - Implemented post-fit inspection of `model_path_` and `device_` against official TabICLv2 specifications.
+  - Verification pattern: checks `getattr(model, "model_path_", None)`, resolves both paths with `resolve(strict=True)`, computes SHA-256 of the actual loaded file on disk, and verifies matching runtime device (`device_`).
+  - If either model's checkpoint is missing, unverified, or mismatched, preflight fails closed.
+
+### 5.3 Patch 3: Removal of Arbitrary Workload Defaults
+- **Defective behavior:** Unspecified workload configuration fell back to arbitrary defaults (`max_memory_mb=11000.0`, `context_size=1000`, `n_features=20`, `n_estimators=10`).
+- **Remediation:**
+  - Implemented strict schema validation via `REQUIRED_WORKLOAD_FIELDS`: requires `context_size`, `n_features`, `n_estimators`, `prediction_batch_size`, `device`, `use_amp`, `offload_mode`, `max_memory_mb`.
+  - Missing any required field produces `BLOCKED_WORKLOAD_CONFIG_INCOMPLETE` with zero manufactured defaults.
+  - Level 3 records actual parameters used, output shapes, alpha grid, peak allocated and reserved VRAM, exceptions, and loaded artifact identity.
+
+### 5.4 Patch 4: Separation of Declared Provenance from Verified Source Lineage
+- **Defective behavior:** `verify_feature_provenance()` returned `status: "PASSED"` solely based on user-supplied metadata dictionaries, equating metadata syntax with empirical lineage proof. Also, `scan_feature_names()` allowed substring bypass for allowlisted terms and failed to detect boundary tokens like `pat_post_over_assets`.
+- **Remediation:**
+  - `verify_feature_provenance()` now returns the final release decision and NEVER returns `"PASSED"`.
+  - Authorized release status is strictly `VERIFIED_SOURCE_LINEAGE`, guarded by `feature_release_authorized(result)`.
+  - Metadata-only records return `BLOCKED_SOURCE_LINEAGE_UNVERIFIED`, with detailed subchecks `name_screen: "NAME_SCREEN_PASSED"` and `declared_provenance: "DECLARED_PROVENANCE_CONSISTENT"`.
+  - Trusted deterministic validator for $c_{k050}$: requires both `pat_pre` and `total_assets_pre`, resolves columns through human-approved `columns.yaml`, validates monetary units, statement scope (`consolidated`), and reporting stage (`pre_audit`), checks publication timestamps $\le$ cutoff, rejects non-positive assets as NaN, and independently recomputes $0.05 \cdot \frac{|PAT_{pre}|}{Assets_{pre}}$ against stored values.
+  - Historical lags require verified `lag_lineage` (matching issuer, exact fiscal-year lag offset, approved source column, availability date $\le$ cutoff).
+  - Fixed `scan_feature_names()`: exact allowlist matching, boundary-token regex for forbidden targets, and removal of defective `d_` prefix to preserve valid features like `d_roa`.
+
+### 5.5 Patches 5 & 6: Adversarial & Falsification Test Coverage
+- **`test_api_preflight.py` (62 tests):**
+  - Asserts that mock execution produces `BLOCKED`, never `ALL_PROBES_PASSED`.
+  - Checks missing/wrong `model_path_`, file hash mismatches, missing classifier checkpoint, disabled auto-download, missing workload schema fields, GPU OOM, and CLI exit codes.
+- **`test_hta_ref.py` (40 tests):**
+  - Added full falsification test suite for $c_{k050}$: valid computation, invalid numerator ($PAT_{post}$ substitution caught and flagged as audited leakage), forged formula description with incorrect executed values, missing denominator, missing source records, unapproved caller aliases, publication date after cutoff, inconsistent monetary units, inconsistent statement scope, non-positive assets handling, row-level failure preservation, passthrough feature verification, historical lag lineage verification, boundary-token name scan, and `d_roa` preservation.
+
+### 5.6 Patch 7: Complete PASS Audit Across Affected Codebases
+- Audited every `"status": "PASSED"` in `api_preflight.py` and `hta_ref.py`:
+  - In `hta_ref.py`, `"PASSED"` was completely eliminated from `verify_feature_provenance()`. Only `VERIFIED_SOURCE_LINEAGE` can authorize release.
+  - In `api_preflight.py`, individual component `PASSED` requires verified real execution (`mocked is False`, `evidence_type == "REAL_EXECUTION"`, `loaded_checkpoint_verified is True`). Overall `ALL_PROBES_PASSED` requires real execution of all mandatory engines, verified checkpoints, and verified registered workload.
+
+---
+
+## 6. Current Dispositions
+
+- **Engineering Code Correctness:** `ENGINEERING_REPAIR_VERIFIED`
+  - 130/130 candidate tests passed across all modules.
+  - Python compileall succeeded without syntax errors or warnings.
+  - Zero fabricated passes; mock-only execution strictly bounded to orchestration testing.
+- **Real-World Gate G0 Readiness:** `G0_STOP_BLOCKER`
+  - Preflight on actual host remains blocked due to missing external dependencies (`tabicl`, `catboost`, `ngboost`), missing approved model checkpoints (`TabICLRegressor`, `TabICLClassifier`), and unapproved physical column mapping in `columns.yaml`.
+  - In accordance with specification rules, no candidate artifacts have been promoted to root paths, and no autonomous approval has been claimed.

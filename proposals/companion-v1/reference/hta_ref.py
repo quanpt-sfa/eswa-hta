@@ -29,6 +29,7 @@ the authoritative production location `reference/hta_ref.py`.
 """
 
 import math
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
@@ -1070,6 +1071,40 @@ def check_point_in_time(
     return res
 
 
+_FORBIDDEN_NAME_TOKEN_RE = re.compile(
+    r"(^|_)(pat_post|delta|audit_adj|audit_adjustment|is_zero_adj|eligible_label|"
+    r"eligible_model|usable_pair|sign_change|boundary_case|lnst_sau_kiem_toan)(_|$)"
+)
+_FORBIDDEN_NAME_SUBSTRINGS = ("fs_aud", "post_audit", "audited")
+_FORBIDDEN_NAME_EXACT = {"d"}
+_FORBIDDEN_NAME_SUFFIXES = ("_aud", "_post")
+_LAG_SUFFIX_RE = re.compile(r"_lag(\d+)$")
+
+
+def _is_forbidden_name(name: str) -> bool:
+    """Name screen for post-audit outcomes/targets (a screen, never proof of lineage).
+
+    Boundary-token matching is used so ``pat_post_over_assets`` is caught while
+    legitimate names such as ``d_roa``, ``dividend_pre``, ``fixed_assets_pre`` and
+    ``debt_pre`` are not (the single-letter outcome ``d`` is matched exactly only).
+    ``c_k050`` is handled by the caller (registered X2 predictor).
+    """
+    n = str(name).lower()
+    if n in _FORBIDDEN_NAME_EXACT:
+        return True
+    if _FORBIDDEN_NAME_TOKEN_RE.search(n):
+        return True
+    if any(sub in n for sub in _FORBIDDEN_NAME_SUBSTRINGS):
+        return True
+    if n.endswith(_FORBIDDEN_NAME_SUFFIXES):
+        return True
+    if n.startswith("y_k"):
+        return True
+    if n.startswith("c_k") and n != "c_k050":
+        return True
+    return False
+
+
 def scan_feature_names(
     feature_names: Sequence[str],
     allow: Optional[Sequence[str]] = None,
@@ -1078,11 +1113,16 @@ def scan_feature_names(
     """
     Scans candidate feature column names for potential post-audit leakage (§2 D08, §5 G2).
 
+    This is a NAME SCREEN ONLY. A clean name does not authorize release of a
+    feature; see ``verify_feature_provenance`` for lineage verification.
+
     Rules:
-      - Forbidden outcome variables and substrings: 'aud', 'post', 'delta', 'pat_post', 'audit_adj', 'is_zero_adj', 'eligible_'
+      - Forbidden outcome variables are matched on name boundary tokens
+        (``pat_post``, ``delta``, ``audit_adj``, ``is_zero_adj``, ``eligible_*``, ...),
+        plus 'fs_aud'/'post_audit'/'audited' substrings and ``_aud``/``_post`` suffixes.
       - Authorized pre-audit predictor: 'c_k050' (normalized threshold 0.05 * |PAT_pre| / assets_pre) registered in X2.
-      - Other 'c_k*' variables (e.g. c_k075, c_k100) remain strictly flagged unless explicitly allowed.
-      - Allowed: explicit entries in allowlist, or verified lagged variables (e.g. ending in _lag1, _lag2).
+      - Other 'c_k*' and any 'y_k*' variables remain strictly flagged unless explicitly allowed.
+      - Allowlist membership is EXACT (a name merely containing an allowed name is not allowed).
 
     Returns
     -------
@@ -1090,225 +1130,374 @@ def scan_feature_names(
         List of flagged feature names. Returns [] if all features are clean.
     """
     allowlist = set(DEFAULT_LEAKAGE_ALLOWLIST if allow is None else allow)
-    forbidden_exact = {
-        "pat_post", "delta", "d", "is_zero_adj", "eligible_label", "eligible_model",
-        "usable_pair", "sign_change", "boundary_case"
-    }
-    forbidden_substrings = ["audit_adj", "fs_aud", "post_audit", "audited"]
 
     flagged = []
     for col in feature_names:
         c_lower = str(col).lower()
-        if col in allowlist or c_lower in allowlist:
+        if col in allowlist:
             continue
-        # Verified lagged items in allowlist
-        if any(c_lower.endswith(f"_lag{i}") for i in range(1, 10)):
-            if c_lower in allowlist or any(allowed_pat in c_lower for allowed_pat in allowlist):
-                continue
         # c_k050 is an authorized X2 pre-audit predictor (§2 D13, §6.1)
         if c_lower == "c_k050":
-            if allow_registered_x2_predictors:
-                continue
-            else:
+            if not allow_registered_x2_predictors:
                 flagged.append(col)
-                continue
-        # Exact forbidden outcomes or unapproved threshold/outcome prefixes
-        if c_lower in forbidden_exact or c_lower.startswith("y_k") or c_lower.startswith("c_k"):
-            flagged.append(col)
             continue
-        # Forbidden substrings (unless lagged and allowed)
-        if any(sub in c_lower for sub in forbidden_substrings) or c_lower.endswith("_aud") or c_lower.endswith("_post"):
+        if _is_forbidden_name(c_lower):
             flagged.append(col)
-            continue
-
     return flagged
+
+
+# ------------------------------------------------------------------------------
+# Verified source lineage (§2 D08-D09). Declared metadata is NOT lineage.
+# ------------------------------------------------------------------------------
+
+C_K050_REQUIRED_SOURCES = frozenset({"pat_pre", "total_assets_pre"})
+C_K050_THRESHOLD = 0.05
+# Candidate numerical tolerance (no value is registered in protocol.yaml; it is a parameter).
+DEFAULT_LINEAGE_RTOL = 1e-9
+DEFAULT_LINEAGE_ATOL = 1e-12
+
+_PROVENANCE_RELEASE_STATUS = "VERIFIED_SOURCE_LINEAGE"
+
+
+def resolve_approved_column_mapping(columns_cfg: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, str]], str]:
+    """Resolve semantic -> physical column names from a parsed ``columns.yaml``.
+
+    Returns ``(None, reason)`` unless the mapping is human-approved and every
+    entry used carries a selected physical column. Caller-supplied aliases are
+    never trusted; only this authoritative mapping is.
+    """
+    if not isinstance(columns_cfg, dict):
+        return None, "columns configuration missing"
+    if columns_cfg.get("approved_by_human") is not True:
+        return None, "columns.yaml is not approved by a human (approved_by_human != true)"
+    mapping: Dict[str, str] = {}
+    for section in columns_cfg.values():
+        if not isinstance(section, dict):
+            continue
+        for key, entry in section.items():
+            if isinstance(entry, dict) and "physical_column_selected" in entry:
+                sel = entry["physical_column_selected"]
+                sem = str(entry.get("semantic_name", key))
+                if sel is not None and str(sel).strip():
+                    mapping[sem] = str(sel)
+    if not mapping:
+        return None, "no physical_column_selected entries in columns.yaml"
+    return mapping, "ok"
+
+
+def feature_release_authorized(result: Dict[str, Any]) -> bool:
+    """A feature may be released only on VERIFIED_SOURCE_LINEAGE.
+
+    NAME_SCREEN_PASSED and DECLARED_PROVENANCE_CONSISTENT never authorize release.
+    """
+    return (
+        isinstance(result, dict)
+        and result.get("status") == _PROVENANCE_RELEASE_STATUS
+        and result.get("release_authorized") is True
+    )
+
+
+def _prov_result(feature_name: str, status: str, reason: str, subchecks: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    return {
+        "feature": feature_name,
+        "status": status,
+        "reason": reason,
+        "release_authorized": status == _PROVENANCE_RELEASE_STATUS,
+        "subchecks": subchecks or {},
+    }
+
+
+def _broadcast_dates(spec: Any, index: pd.Index) -> Optional[pd.Series]:
+    """Per-row UTC timestamps from a scalar or Series; None when absent."""
+    if spec is None:
+        return None
+    if isinstance(spec, pd.Series):
+        ser = pd.to_datetime(spec.reindex(index), errors="coerce", utc=True)
+    else:
+        ser = pd.Series(pd.to_datetime(spec, errors="coerce", utc=True), index=index)
+    return ser
+
+
+def _verify_source_inputs(
+    semantics: Sequence[str],
+    mapping: Dict[str, str],
+    ev: Dict[str, Any],
+    cutoffs: pd.Series,
+) -> Tuple[Optional[str], str, Dict[str, str]]:
+    """Check mapped columns, stage, units, statement scope and publication timestamps.
+
+    Returns ``(failure_status or None, reason, semantic->physical)``.
+    """
+    data = ev["source_data"]
+    phys: Dict[str, str] = {}
+    for sem in semantics:
+        if sem not in mapping:
+            return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"'{sem}' has no approved physical mapping.", phys
+        col = mapping[sem]
+        if col not in data.columns:
+            return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"Approved physical column '{col}' absent from source data.", phys
+        phys[sem] = col
+
+    stages = ev.get("reporting_stage") or {}
+    for sem, col in phys.items():
+        stage = stages.get(col)
+        if stage is None:
+            return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"Reporting stage of '{col}' not evidenced.", phys
+        if str(stage) != "pre_audit":
+            return "FAILED_LEAKAGE_AUDITED_INPUT", f"Source '{col}' is reported at stage '{stage}', not pre_audit.", phys
+
+    for key, label in (("units", "monetary units"), ("statement_scope", "statement scope")):
+        vals = ev.get(key) or {}
+        seen = []
+        for col in phys.values():
+            if vals.get(col) is None:
+                return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"{label} of '{col}' not evidenced.", phys
+            seen.append(str(vals[col]))
+        if len(set(seen)) > 1:
+            return "FAILED_SOURCE_LINEAGE_INCONSISTENT", f"Inconsistent {label} across sources: {sorted(set(seen))}.", phys
+
+    pubs = ev.get("source_publication_dates") or {}
+    for col in phys.values():
+        dates = _broadcast_dates(pubs.get(col), data.index)
+        if dates is None or dates.isna().any():
+            return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"Source publication timestamps missing for '{col}'.", phys
+        if bool((dates > cutoffs).any()):
+            return "FAILED_TEMPORAL_LEAKAGE", f"Source '{col}' published after the prediction cutoff.", phys
+    return None, "ok", phys
+
+
+def _verify_c_k050_values(
+    ev: Dict[str, Any], phys: Dict[str, str], mapping: Dict[str, str], rtol: float, atol: float
+) -> Tuple[Optional[str], str]:
+    """Independent recomputation of c_k050 = 0.05 * |pat_pre| / total_assets_pre."""
+    data = ev["source_data"]
+    stored = ev["stored_values"]
+    pat = pd.to_numeric(data[phys["pat_pre"]], errors="coerce").to_numpy(dtype=float)
+    assets = pd.to_numeric(data[phys["total_assets_pre"]], errors="coerce").to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        expected = np.where(assets > 0, C_K050_THRESHOLD * np.abs(pat) / assets, np.nan)
+    actual = pd.to_numeric(stored.reindex(data.index), errors="coerce").to_numpy(dtype=float)
+    if np.isclose(actual, expected, rtol=rtol, atol=atol, equal_nan=True).all():
+        return None, "ok"
+    # Diagnose: does the stored feature equal the same transformation of a post-audit input?
+    post_cols = []
+    if "pat_post" in mapping and mapping["pat_post"] in data.columns:
+        post_cols.append(mapping["pat_post"])
+    post_cols += [c for c in data.columns if _FORBIDDEN_NAME_TOKEN_RE.search(str(c).lower()) and c not in post_cols]
+    for pc in post_cols:
+        post = pd.to_numeric(data[pc], errors="coerce").to_numpy(dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            alt = np.where(assets > 0, C_K050_THRESHOLD * np.abs(post) / assets, np.nan)
+        if np.isclose(actual, alt, rtol=rtol, atol=atol, equal_nan=True).all():
+            return "FAILED_LEAKAGE_AUDITED_INPUT", f"Stored c_k050 equals the transformation of post-audit column '{pc}'."
+    return "FAILED_TRANSFORMATION_MISMATCH", "Stored c_k050 differs from the independent recomputation 0.05*|pat_pre|/total_assets_pre."
+
+
+def _verify_lag_lineage(
+    feature_name: str, lag_n: int, mapping: Dict[str, str], ev: Dict[str, Any], cutoffs_scalar: pd.Timestamp
+) -> Tuple[Optional[str], str]:
+    ll = ev.get("lag_lineage")
+    needed = {"firm_id", "source_firm_id", "fiscal_year", "source_fiscal_year", "source_column", "availability_date"}
+    if not isinstance(ll, pd.DataFrame) or ll.empty or not needed.issubset(ll.columns):
+        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Lag lineage evidence (issuer, fiscal years, source identity, availability date) missing."
+    base = _LAG_SUFFIX_RE.sub("", feature_name.lower())
+    if base not in mapping:
+        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"Base semantic '{base}' has no approved physical mapping."
+    if (ll["firm_id"].astype(str) != ll["source_firm_id"].astype(str)).any():
+        return "FAILED_SOURCE_LINEAGE_INCONSISTENT", "Lag source belongs to a different issuer."
+    offset = pd.to_numeric(ll["fiscal_year"], errors="coerce") - pd.to_numeric(ll["source_fiscal_year"], errors="coerce")
+    if offset.isna().any() or (offset != lag_n).any():
+        return "FAILED_SOURCE_LINEAGE_INCONSISTENT", f"Fiscal-year offset does not equal the declared lag {lag_n}."
+    if (ll["source_column"].astype(str) != mapping[base]).any():
+        return "FAILED_SOURCE_LINEAGE_INCONSISTENT", "Lag source column differs from the approved mapping."
+    avail = pd.to_datetime(ll["availability_date"], errors="coerce", utc=True)
+    if avail.isna().any():
+        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Actual availability date of the prior-year report is missing."
+    cut = pd.to_datetime(ev.get("prediction_cutoffs", cutoffs_scalar), errors="coerce", utc=True)
+    if isinstance(cut, pd.Series):
+        cut = cut.reindex(ll.index)
+    if bool((avail > cut).any()) if isinstance(cut, pd.Series) else bool((avail > cut).any()):
+        return "FAILED_TEMPORAL_LEAKAGE", "Prior-year report became available after the prediction cutoff."
+    return None, "ok"
 
 
 def verify_feature_provenance(
     feature_name: str,
     provenance_record: Optional[Dict[str, Any]],
-    prediction_cutoff: Optional[Union[str, pd.Timestamp]] = None
+    prediction_cutoff: Optional[Union[str, pd.Timestamp]] = None,
+    lineage_evidence: Optional[Dict[str, Any]] = None,
+    rtol: float = DEFAULT_LINEAGE_RTOL,
+    atol: float = DEFAULT_LINEAGE_ATOL,
 ) -> Dict[str, Any]:
     """
-    Validates semantic feature identity, physical source columns, formula,
-    reporting scope, and point-in-time timestamp against prediction cutoff (§2 D08-D09).
+    Separates declared provenance from verified source lineage (§2 D08-D09).
 
-    A feature that passes its name scan but lacks required provenance must not
-    be treated as verified safe. Where a verified provenance registry is not
-    available, returns BLOCKED_UNRESOLVED_PROVENANCE.
+    The returned ``status`` is the final RELEASE decision:
+
+    - ``VERIFIED_SOURCE_LINEAGE``: the only status that authorizes release. It is
+      reached only when actual source records/transformation evidence were
+      checked (mapped columns, stage, units, scope, publication timestamps and an
+      independent recomputation of the stored values).
+    - ``BLOCKED_SOURCE_LINEAGE_UNVERIFIED``: metadata is internally consistent but
+      no (or insufficient) real evidence was supplied.
+    - ``FAILED_LEAKAGE_AUDITED_INPUT`` / ``FAILED_TEMPORAL_LEAKAGE`` /
+      ``FAILED_SOURCE_LINEAGE_INCONSISTENT`` / ``FAILED_TRANSFORMATION_MISMATCH``.
+    - ``BLOCKED_UNRESOLVED_PROVENANCE`` / ``BLOCKED_UNRESOLVED_TIMESTAMP`` /
+      ``BLOCKED_INVALID_CUTOFF``.
+
+    ``subchecks`` reports ``NAME_SCREEN_PASSED`` and ``DECLARED_PROVENANCE_CONSISTENT``
+    separately; neither authorizes release. ``"PASSED"`` is never returned.
 
     Parameters
     ----------
-    feature_name : str
-        Name of the candidate feature.
-    provenance_record : Optional[Dict[str, Any]]
-        Dictionary containing metadata:
-        - 'source_columns': List[str], physical columns used to compute feature.
-        - 'formula': str, description or mathematical formula.
-        - 'reporting_scope': str, e.g. 'pre_audit', 'unaudited_q4', 'historical_audited_lag'.
-        - 'temporal_status': str, 't_pre', 'lag', 'static'.
-        - 'publication_date': Union[str, pd.Timestamp], timestamp when data was public.
-    prediction_cutoff : Optional[Union[str, pd.Timestamp]]
-        Prediction cutoff timestamp.
-
-    Returns
-    -------
-    Dict[str, Any]
-        Dictionary with 'status' (PASSED, FAILED_LEAKAGE_AUDITED_INPUT, FAILED_TEMPORAL_LEAKAGE,
-        BLOCKED_UNRESOLVED_PROVENANCE, BLOCKED_UNRESOLVED_TIMESTAMP) and diagnostic details.
+    provenance_record : dict
+        Declared metadata: 'source_columns', 'formula' (descriptive only, never used
+        as proof), 'reporting_scope', 'temporal_status', 'publication_date'.
+    lineage_evidence : Optional[dict]
+        Actual evidence: 'columns_config' (parsed, human-approved columns.yaml),
+        'source_data' (DataFrame of physical columns), 'stored_values' (Series of the
+        feature as stored), 'source_publication_dates' ({physical: dates}),
+        'prediction_cutoffs' (optional per-row), 'units', 'statement_scope',
+        'reporting_stage' ({physical: value}), and for lagged features 'lag_lineage'
+        (DataFrame: firm_id, source_firm_id, fiscal_year, source_fiscal_year,
+        source_column, availability_date).
     """
     if provenance_record is None or not isinstance(provenance_record, dict):
-        return {
-            "feature": feature_name,
-            "status": "BLOCKED_UNRESOLVED_PROVENANCE",
-            "reason": "Provenance registry record is missing or incomplete; unverified feature cannot be treated as safe.",
-        }
+        return _prov_result(feature_name, "BLOCKED_UNRESOLVED_PROVENANCE",
+                            "Provenance registry record is missing or incomplete; unverified feature cannot be treated as safe.")
 
-    # Required fields in provenance record
-    required_fields = ["source_columns", "formula", "temporal_status", "reporting_scope"]
-    for rf in required_fields:
+    for rf in ["source_columns", "formula", "temporal_status", "reporting_scope"]:
         if rf not in provenance_record or provenance_record[rf] is None:
-            return {
-                "feature": feature_name,
-                "status": "BLOCKED_UNRESOLVED_PROVENANCE",
-                "reason": f"Required provenance field '{rf}' is missing or null.",
-            }
+            return _prov_result(feature_name, "BLOCKED_UNRESOLVED_PROVENANCE",
+                                f"Required provenance field '{rf}' is missing or null.")
 
-    if "publication_date" not in provenance_record or provenance_record["publication_date"] is None:
-        return {
-            "feature": feature_name,
-            "status": "BLOCKED_UNRESOLVED_TIMESTAMP",
-            "reason": "Publication date is missing or null; unknown publication time is not verified safe.",
-        }
-
+    if provenance_record.get("publication_date") is None:
+        return _prov_result(feature_name, "BLOCKED_UNRESOLVED_TIMESTAMP",
+                            "Publication date is missing or null; unknown publication time is not verified safe.")
     pub_date = pd.to_datetime(provenance_record["publication_date"], errors="coerce", utc=True)
     if pd.isna(pub_date):
-        return {
-            "feature": feature_name,
-            "status": "BLOCKED_UNRESOLVED_TIMESTAMP",
-            "reason": f"Publication date '{provenance_record['publication_date']}' is missing or unparseable; unknown publication time is not verified safe.",
-        }
+        return _prov_result(feature_name, "BLOCKED_UNRESOLVED_TIMESTAMP",
+                            f"Publication date '{provenance_record['publication_date']}' is unparseable; unknown publication time is not verified safe.")
 
-    # Point-in-time prediction cutoff check: fails closed if missing, null, or unparseable
     if prediction_cutoff is None:
-        return {
-            "feature": feature_name,
-            "status": "BLOCKED_INVALID_CUTOFF",
-            "reason": "Prediction cutoff is missing or null; point-in-time availability cannot be certified.",
-        }
+        return _prov_result(feature_name, "BLOCKED_INVALID_CUTOFF",
+                            "Prediction cutoff is missing or null; point-in-time availability cannot be certified.")
     cutoff = pd.to_datetime(prediction_cutoff, errors="coerce", utc=True)
     if pd.isna(cutoff):
-        return {
-            "feature": feature_name,
-            "status": "BLOCKED_INVALID_CUTOFF",
-            "reason": f"Prediction cutoff '{prediction_cutoff}' is unparseable.",
-        }
+        return _prov_result(feature_name, "BLOCKED_INVALID_CUTOFF", f"Prediction cutoff '{prediction_cutoff}' is unparseable.")
     if pub_date > cutoff:
-        return {
-            "feature": feature_name,
-            "status": "FAILED_TEMPORAL_LEAKAGE",
-            "reason": f"Publication date {pub_date} is after prediction cutoff {cutoff}.",
-        }
-
-    # Controlled semantic identifiers for post-audit outcomes
-    forbidden_exact_sources = {
-        "pat_post", "delta", "d", "is_zero_adj", "eligible_label", "eligible_model",
-        "usable_pair", "sign_change", "boundary_case", "lnst_sau_kiem_toan"
-    }
-    forbidden_source_prefixes = (
-        "fs_aud_", "audit_adj_", "audit_adjustment_", "post_audit_", "delta_", "d_"
-    )
-    forbidden_source_suffixes = ("_post", "_aud", "_audited")
-
-    f_lower = str(feature_name).lower()
-
-    # Declared metadata alone cannot certify an outcome variable
-    is_declared_feature_outcome = (
-        f_lower in forbidden_exact_sources
-        or f_lower.startswith(forbidden_source_prefixes)
-        or f_lower.endswith(forbidden_source_suffixes)
-        or f_lower.startswith("y_k")
-        or (f_lower.startswith("c_k") and f_lower != "c_k050")
-    )
-    if is_declared_feature_outcome:
-        is_feature_hist_lag = (
-            any(f_lower.endswith(f"_lag{i}") for i in range(1, 10))
-            and provenance_record.get("temporal_status") == "lag"
-            and provenance_record.get("reporting_scope") in {"historical_audited_lag", "lag"}
-        )
-        if not is_feature_hist_lag:
-            return {
-                "feature": feature_name,
-                "status": "FAILED_LEAKAGE_AUDITED_INPUT",
-                "reason": f"Feature '{feature_name}' is a forbidden outcome or unapproved target variable.",
-            }
+        return _prov_result(feature_name, "FAILED_TEMPORAL_LEAKAGE",
+                            f"Publication date {pub_date} is after prediction cutoff {cutoff}.")
 
     source_cols = provenance_record.get("source_columns")
     if not isinstance(source_cols, (list, tuple)) or len(source_cols) == 0:
-        return {
-            "feature": feature_name,
-            "status": "BLOCKED_UNRESOLVED_PROVENANCE",
-            "reason": "Feature has missing or empty source_columns.",
-        }
+        return _prov_result(feature_name, "BLOCKED_UNRESOLVED_PROVENANCE", "Feature has missing or empty source_columns.")
 
-    # 1. Check for unauthorized audited inputs in physical source columns
+    f_lower = str(feature_name).lower()
+    temporal = provenance_record.get("temporal_status")
+    scope = provenance_record.get("reporting_scope")
+    lag_match = _LAG_SUFFIX_RE.search(f_lower)
+    declared_hist_lag = bool(lag_match) and temporal == "lag" and scope in {"historical_audited_lag", "lag"}
+
+    # ---- Name screen (feature, declared sources, descriptive formula identifiers) ----
+    if _is_forbidden_name(f_lower) and f_lower != "c_k050" and not declared_hist_lag:
+        return _prov_result(feature_name, "FAILED_LEAKAGE_AUDITED_INPUT",
+                            f"Feature '{feature_name}' is a forbidden outcome or unapproved target variable.")
     for sc in source_cols:
-        sc_lower = str(sc).lower()
-        is_audited_input = (
-            sc_lower in forbidden_exact_sources
-            or sc_lower.startswith(forbidden_source_prefixes)
-            or sc_lower.endswith(forbidden_source_suffixes)
-            or sc_lower.startswith("y_k")
-            or (sc_lower.startswith("c_k") and sc_lower != "c_k050")
-        )
-        if is_audited_input:
-            is_valid_lag = (
-                any(sc_lower.endswith(f"_lag{i}") for i in range(1, 10))
-                and provenance_record.get("temporal_status") == "lag"
-                and provenance_record.get("reporting_scope") in {"historical_audited_lag", "lag"}
-            )
-            if not is_valid_lag:
-                return {
-                    "feature": feature_name,
-                    "status": "FAILED_LEAKAGE_AUDITED_INPUT",
-                    "reason": f"Feature '{feature_name}' derives from forbidden audited source '{sc}'.",
-                }
+        sc_l = str(sc).lower()
+        if _is_forbidden_name(sc_l) and sc_l != "c_k050" and not (declared_hist_lag and _LAG_SUFFIX_RE.search(sc_l)):
+            return _prov_result(feature_name, "FAILED_LEAKAGE_AUDITED_INPUT",
+                                f"Feature '{feature_name}' derives from forbidden audited source '{sc}'.")
+    if not declared_hist_lag:
+        for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(provenance_record["formula"]).lower()):
+            if tok != "d" and _is_forbidden_name(tok) and tok != "c_k050":
+                return _prov_result(feature_name, "FAILED_LEAKAGE_AUDITED_INPUT",
+                                    f"Declared formula references forbidden post-audit identifier '{tok}'.")
+    subchecks = {"name_screen": "NAME_SCREEN_PASSED"}
 
-    # 2. Strict validation for c_k050: registered formula and source lineage
-    if f_lower == "c_k050":
-        if provenance_record.get("temporal_status") != "t_pre":
-            return {
-                "feature": feature_name,
-                "status": "FAILED_LEAKAGE_AUDITED_INPUT",
-                "reason": "c_k050 temporal_status must be 't_pre'.",
-            }
-        approved_pre_sources = {"pat_pre", "total_assets_pre", "assets_pre", "total_assets"}
-        for sc in source_cols:
-            if str(sc).lower() not in approved_pre_sources:
-                return {
-                    "feature": feature_name,
-                    "status": "FAILED_LEAKAGE_AUDITED_INPUT",
-                    "reason": f"c_k050 derives from unapproved source column '{sc}', expected pre-audit inputs only.",
-                }
-        formula_str = str(provenance_record.get("formula", "")).lower()
-        if any(bad in formula_str for bad in ["pat_post", "delta", "pat_aud", "fs_aud"]):
-            return {
-                "feature": feature_name,
-                "status": "FAILED_LEAKAGE_AUDITED_INPUT",
-                "reason": "c_k050 formula references forbidden post-audit variables.",
-            }
-        if not ("0.05" in formula_str or "5%" in formula_str) or "pat_pre" not in formula_str:
-            return {
-                "feature": feature_name,
-                "status": "BLOCKED_UNRESOLVED_PROVENANCE",
-                "reason": f"c_k050 formula does not match registered threshold formula (0.05 * |pat_pre| / assets_pre).",
-            }
-
-    return {
-        "feature": feature_name,
-        "status": "PASSED",
-        "reason": "Feature provenance, source lineage, and point-in-time timestamp verified safe.",
+    # ---- Declared-consistency (metadata vs metadata; never lineage) ----
+    allowed_pairs = {
+        "t_pre": {"pre_audit", "unaudited_q4"},
+        "lag": {"historical_audited_lag", "lag"},
     }
+    if temporal in allowed_pairs and scope not in allowed_pairs[temporal]:
+        return _prov_result(feature_name, "FAILED_SOURCE_LINEAGE_INCONSISTENT",
+                            f"Declared temporal_status '{temporal}' is inconsistent with reporting_scope '{scope}'.", subchecks)
+
+    is_c_k050 = f_lower == "c_k050"
+    declared_sources = {str(sc).lower() for sc in source_cols}
+    if is_c_k050:
+        if temporal != "t_pre" or scope != "pre_audit":
+            return _prov_result(feature_name, "FAILED_LEAKAGE_AUDITED_INPUT",
+                                "c_k050 must be declared temporal_status='t_pre' and reporting_scope='pre_audit'.", subchecks)
+        missing = C_K050_REQUIRED_SOURCES - declared_sources
+        if missing:
+            return _prov_result(feature_name, "BLOCKED_UNRESOLVED_PROVENANCE",
+                                f"c_k050 lineage is missing required source(s) {sorted(missing)}.", subchecks)
+        extra = declared_sources - C_K050_REQUIRED_SOURCES
+        if extra:
+            return _prov_result(feature_name, "FAILED_SOURCE_LINEAGE_INCONSISTENT",
+                                f"c_k050 declares unregistered source(s) {sorted(extra)}.", subchecks)
+    subchecks["declared_provenance"] = "DECLARED_PROVENANCE_CONSISTENT"
+
+    # ---- Verified source lineage: requires actual evidence ----
+    def unverified(reason: str) -> Dict[str, Any]:
+        sc = dict(subchecks)
+        sc["source_lineage"] = "NOT_VERIFIED"
+        return _prov_result(feature_name, "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", reason, sc)
+
+    ev = lineage_evidence
+    if not isinstance(ev, dict):
+        return unverified("Declared provenance is internally consistent, but no actual source records/transformation evidence were supplied.")
+    mapping, why = resolve_approved_column_mapping(ev.get("columns_config"))
+    if mapping is None:
+        return unverified(f"Authoritative column mapping unavailable: {why}.")
+
+    if declared_hist_lag:
+        status, reason = _verify_lag_lineage(f_lower, int(lag_match.group(1)), mapping, ev, cutoff)
+        if status:
+            return _prov_result(feature_name, status, reason, dict(subchecks, source_lineage=status))
+        return _prov_result(feature_name, _PROVENANCE_RELEASE_STATUS,
+                            "Historical audited lag verified from issuer, fiscal-year offset, source identity and availability date.",
+                            dict(subchecks, source_lineage=_PROVENANCE_RELEASE_STATUS))
+
+    data = ev.get("source_data")
+    stored = ev.get("stored_values")
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return unverified("Source records missing or empty.")
+    if not isinstance(stored, pd.Series) or not stored.index.equals(data.index):
+        return unverified("Stored feature values missing or not aligned with source records (no transformation evidence).")
+
+    cut_series = _broadcast_dates(ev.get("prediction_cutoffs", cutoff), data.index)
+    if cut_series is None or cut_series.isna().any():
+        return _prov_result(feature_name, "BLOCKED_INVALID_CUTOFF", "Per-row prediction cutoffs missing or unparseable.", subchecks)
+
+    if is_c_k050:
+        sems = sorted(C_K050_REQUIRED_SOURCES)
+    elif len(declared_sources) == 1:
+        sems = sorted(declared_sources)  # pass-through feature
+    else:
+        return unverified(f"No trusted deterministic validator is registered for '{feature_name}'.")
+
+    fail, reason, phys = _verify_source_inputs(sems, mapping, ev, cut_series)
+    if fail:
+        if fail.startswith("BLOCKED"):
+            return unverified(reason)
+        return _prov_result(feature_name, fail, reason, dict(subchecks, source_lineage=fail))
+
+    if is_c_k050:
+        fail, reason = _verify_c_k050_values(ev, phys, mapping, rtol, atol)
+    else:
+        a = pd.to_numeric(data[phys[sems[0]]], errors="coerce").to_numpy(dtype=float)
+        b = pd.to_numeric(stored, errors="coerce").to_numpy(dtype=float)
+        ok = np.isclose(a, b, rtol=rtol, atol=atol, equal_nan=True).all()
+        fail, reason = (None, "ok") if ok else ("FAILED_TRANSFORMATION_MISMATCH", "Stored values differ from the mapped source column.")
+    if fail:
+        return _prov_result(feature_name, fail, reason, dict(subchecks, source_lineage=fail))
+
+    return _prov_result(feature_name, _PROVENANCE_RELEASE_STATUS,
+                        "Source lineage verified from mapped source records, units, scope, timestamps and independent recomputation.",
+                        dict(subchecks, source_lineage=_PROVENANCE_RELEASE_STATUS))
 
 
 def numeric_leak_check(

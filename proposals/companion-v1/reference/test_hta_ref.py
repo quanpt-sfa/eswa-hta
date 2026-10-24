@@ -574,7 +574,7 @@ def test_x2_leakage_scanner_and_provenance_contract():
     res_forged = hta_ref.verify_feature_provenance("c_k050", forged_c_k050, prediction_cutoff="2020-03-31")
     assert res_forged["status"] == "FAILED_LEAKAGE_AUDITED_INPUT"
 
-    # Legitimate c_k050 passes provenance validation
+    # Legitimate-looking c_k050 METADATA is consistent but NOT verified lineage: release blocked
     legit_c_k050 = {
         "source_columns": ["pat_pre", "total_assets_pre"],
         "formula": "0.05 * abs(pat_pre) / total_assets_pre",
@@ -583,7 +583,11 @@ def test_x2_leakage_scanner_and_provenance_contract():
         "publication_date": "2020-03-15",
     }
     res_legit = hta_ref.verify_feature_provenance("c_k050", legit_c_k050, prediction_cutoff="2020-03-31")
-    assert res_legit["status"] == "PASSED"
+    assert res_legit["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    assert res_legit["subchecks"]["name_screen"] == "NAME_SCREEN_PASSED"
+    assert res_legit["subchecks"]["declared_provenance"] == "DECLARED_PROVENANCE_CONSISTENT"
+    assert res_legit["release_authorized"] is False
+    assert not hta_ref.feature_release_authorized(res_legit)
 
     # 7. A historical audited feature with a verified publication date before cutoff is permitted
     hist_aud_feature = {
@@ -594,7 +598,7 @@ def test_x2_leakage_scanner_and_provenance_contract():
         "publication_date": "2020-03-15",
     }
     res_hist_valid = hta_ref.verify_feature_provenance("fs_aud_profit_lag1", hist_aud_feature, prediction_cutoff="2020-03-31")
-    assert res_hist_valid["status"] == "PASSED"
+    assert res_hist_valid["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"  # a _lag1 suffix is not lineage
 
     # 8. A historical audited feature published after the cutoff is rejected
     hist_aud_late = {
@@ -628,7 +632,9 @@ def test_x2_leakage_scanner_and_provenance_contract():
             "publication_date": "2020-03-15",
         }
         res_legit_d = hta_ref.verify_feature_provenance(legit_feat, rec, prediction_cutoff="2020-03-31")
-        assert res_legit_d["status"] == "PASSED", f"Expected PASSED for {legit_feat}, got {res_legit_d}"
+        # Not falsely rejected by the name screen, but also not released without evidence
+        assert res_legit_d["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"got {res_legit_d}"
+        assert res_legit_d["subchecks"]["name_screen"] == "NAME_SCREEN_PASSED"
 
     # 11. Missing prediction cutoff fails closed
     rec_valid = {
@@ -663,6 +669,197 @@ def test_x2_leakage_scanner_and_provenance_contract():
     }
     res_c_k075 = hta_ref.verify_feature_provenance("c_k075", rec_c_k075, prediction_cutoff="2020-03-31")
     assert res_c_k075["status"] == "FAILED_LEAKAGE_AUDITED_INPUT" or "BLOCK" in res_c_k075["status"]
+
+
+# ---- Synthetic fixtures (SYNTHETIC ONLY: not an approved mapping, not real data) ----
+_CUTOFF = "2020-03-31"
+_META = {
+    "source_columns": ["pat_pre", "total_assets_pre"],
+    "formula": "0.05 * abs(pat_pre) / total_assets_pre",
+    "temporal_status": "t_pre",
+    "reporting_scope": "pre_audit",
+    "publication_date": "2020-03-15",
+}
+
+
+def _cfg(approved=True):
+    return {
+        "approved_by_human": approved,
+        "outcome_inputs": {
+            "pat_pre": {"semantic_name": "pat_pre", "physical_column_selected": "lnst_pre"},
+            "pat_post": {"semantic_name": "pat_post", "physical_column_selected": "lnst_post"},
+            "total_assets_pre": {"semantic_name": "total_assets_pre", "physical_column_selected": "tts_pre"},
+            "fixed_assets_pre": {"semantic_name": "fixed_assets_pre", "physical_column_selected": "tscd_pre"},
+            "fs_aud_profit": {"semantic_name": "fs_aud_profit", "physical_column_selected": "lnst_aud"},
+        },
+    }
+
+
+def _evidence(stored, pat_pre=(100.0,), pat_post=(150.0,), assets=(1000.0,), **over):
+    n = len(pat_pre)
+    idx = pd.RangeIndex(n)
+    df = pd.DataFrame({"lnst_pre": pat_pre, "lnst_post": pat_post, "tts_pre": assets}, index=idx)
+    ev = {
+        "columns_config": _cfg(),
+        "source_data": df,
+        "stored_values": pd.Series(stored, index=idx, dtype=float),
+        "source_publication_dates": {"lnst_pre": "2020-03-10", "tts_pre": "2020-03-10"},
+        "units": {"lnst_pre": "VND", "tts_pre": "VND"},
+        "statement_scope": {"lnst_pre": "consolidated", "tts_pre": "consolidated"},
+        "reporting_stage": {"lnst_pre": "pre_audit", "tts_pre": "pre_audit"},
+    }
+    ev.update(over)
+    return ev
+
+
+def _verify(meta=None, ev=None, name="c_k050"):
+    return hta_ref.verify_feature_provenance(name, meta or dict(_META), prediction_cutoff=_CUTOFF, lineage_evidence=ev)
+
+
+def test_c_k050_valid_computation_is_verified():
+    # Hand oracle: 0.05 * |100| / 1000 = 0.005
+    res = _verify(ev=_evidence([0.005]))
+    assert res["status"] == "VERIFIED_SOURCE_LINEAGE", res
+    assert res["release_authorized"] is True and hta_ref.feature_release_authorized(res)
+
+
+def test_c_k050_invalid_numerator_post_audit_fails():
+    # Forged metadata is perfectly consistent, but stored value = 0.05*|150|/1000 = 0.0075 (pat_post)
+    res = _verify(ev=_evidence([0.0075]))
+    assert res["status"] == "FAILED_LEAKAGE_AUDITED_INPUT", res
+    assert not hta_ref.feature_release_authorized(res)
+
+
+def test_c_k050_wrong_transformation_fails_even_with_correct_formula_text():
+    # Text claims the registered formula; executed values are 0.5*... (matches no post-audit variant)
+    res = _verify(ev=_evidence([0.0123]))
+    assert res["status"] == "FAILED_TRANSFORMATION_MISMATCH", res
+
+
+def test_c_k050_missing_denominator_in_lineage_is_not_released():
+    meta = dict(_META, source_columns=["pat_pre"])
+    res = _verify(meta, _evidence([0.005]))
+    assert res["status"].startswith("BLOCKED") or res["status"].startswith("FAILED")
+    assert res["release_authorized"] is False
+
+
+def test_c_k050_missing_source_records_blocked():
+    assert _verify(ev=None)["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    ev = _evidence([0.005])
+    ev["source_data"] = ev["source_data"].iloc[0:0]
+    assert _verify(ev=ev)["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    ev = _evidence([0.005])
+    del ev["stored_values"]
+    assert _verify(ev=ev)["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    # Unapproved / absent authoritative mapping never verifies
+    ev = _evidence([0.005], columns_config=_cfg(approved=False))
+    assert _verify(ev=ev)["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+
+
+def test_c_k050_caller_alias_not_trusted():
+    # Declared alias 'assets_pre' is not the registered semantic; never accepted as the denominator
+    meta = dict(_META, source_columns=["pat_pre", "assets_pre"])
+    res = _verify(meta, _evidence([0.005]))
+    assert res["release_authorized"] is False
+    assert res["status"] in {"BLOCKED_UNRESOLVED_PROVENANCE", "FAILED_SOURCE_LINEAGE_INCONSISTENT"}
+
+
+def test_c_k050_publication_after_cutoff_fails():
+    # Source published after the cutoff even though the declared date is early
+    ev = _evidence([0.005], source_publication_dates={"lnst_pre": "2020-03-10", "tts_pre": "2020-04-20"})
+    assert _verify(ev=ev)["status"] == "FAILED_TEMPORAL_LEAKAGE"
+    # Missing source timestamp is unverified, not safe
+    ev = _evidence([0.005], source_publication_dates={"lnst_pre": "2020-03-10"})
+    assert _verify(ev=ev)["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+
+
+def test_c_k050_inconsistent_units_scope_stage():
+    ev = _evidence([0.005], units={"lnst_pre": "VND", "tts_pre": "million_VND"})
+    assert _verify(ev=ev)["status"] == "FAILED_SOURCE_LINEAGE_INCONSISTENT"
+    ev = _evidence([0.005], units={"lnst_pre": "VND"})
+    assert _verify(ev=ev)["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    ev = _evidence([0.005], statement_scope={"lnst_pre": "consolidated", "tts_pre": "separate"})
+    assert _verify(ev=ev)["status"] == "FAILED_SOURCE_LINEAGE_INCONSISTENT"
+    ev = _evidence([0.005], reporting_stage={"lnst_pre": "post_audit", "tts_pre": "pre_audit"})
+    assert _verify(ev=ev)["status"] == "FAILED_LEAKAGE_AUDITED_INPUT"
+
+
+def test_c_k050_non_positive_assets_handling():
+    # assets <= 0 is ineligible: stored must be NaN; a finite value there is a mismatch
+    ok = _evidence([np.nan, 0.005], pat_pre=(100.0, 100.0), pat_post=(1.0, 1.0), assets=(0.0, 1000.0))
+    assert _verify(ev=ok)["status"] == "VERIFIED_SOURCE_LINEAGE"
+    bad = _evidence([0.005, 0.005], pat_pre=(100.0, 100.0), pat_post=(1.0, 1.0), assets=(-5.0, 1000.0))
+    assert _verify(ev=bad)["status"] == "FAILED_TRANSFORMATION_MISMATCH"
+
+
+def test_c_k050_row_level_failure_is_not_masked_by_other_rows():
+    ev = _evidence([0.005, 0.01], pat_pre=(100.0, 100.0), pat_post=(100.0, 100.0), assets=(1000.0, 1000.0))
+    assert _verify(ev=ev)["status"] == "FAILED_TRANSFORMATION_MISMATCH"
+
+
+def test_passthrough_feature_requires_matching_values():
+    meta = {"source_columns": ["fixed_assets_pre"], "formula": "fixed_assets_pre", "temporal_status": "t_pre",
+            "reporting_scope": "pre_audit", "publication_date": "2020-03-15"}
+    df = pd.DataFrame({"tscd_pre": [10.0, 20.0]})
+    base = {
+        "columns_config": _cfg(), "source_data": df,
+        "source_publication_dates": {"tscd_pre": "2020-03-01"}, "units": {"tscd_pre": "VND"},
+        "statement_scope": {"tscd_pre": "consolidated"}, "reporting_stage": {"tscd_pre": "pre_audit"},
+    }
+    good = dict(base, stored_values=pd.Series([10.0, 20.0]))
+    assert _verify(meta, good, name="fixed_assets_pre")["status"] == "VERIFIED_SOURCE_LINEAGE"
+    bad = dict(base, stored_values=pd.Series([10.0, 21.0]))
+    assert _verify(meta, bad, name="fixed_assets_pre")["status"] == "FAILED_TRANSFORMATION_MISMATCH"
+    # A multi-source feature without a registered trusted validator is never verified
+    meta2 = dict(meta, source_columns=["fixed_assets_pre", "debt_pre"])
+    assert _verify(meta2, good, name="leverage_x")["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+
+
+def _lag_meta():
+    return {"source_columns": ["fs_aud_profit_lag1"], "formula": "lag1(fs_aud_profit)",
+            "temporal_status": "lag", "reporting_scope": "historical_audited_lag",
+            "publication_date": "2020-03-15"}
+
+
+def _lag_df(**over):
+    d = {"firm_id": ["A"], "source_firm_id": ["A"], "fiscal_year": [2020], "source_fiscal_year": [2019],
+         "source_column": ["lnst_aud"], "availability_date": ["2020-03-01"]}
+    d.update(over)
+    return pd.DataFrame(d)
+
+
+def test_historical_lag_verified_only_with_full_lineage():
+    ev = {"columns_config": _cfg(), "lag_lineage": _lag_df()}
+    res = _verify(_lag_meta(), ev, name="fs_aud_profit_lag1")
+    assert res["status"] == "VERIFIED_SOURCE_LINEAGE", res
+    # no lineage evidence -> blocked
+    assert _verify(_lag_meta(), None, name="fs_aud_profit_lag1")["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    # wrong issuer / wrong fiscal-year offset / wrong source column / late or missing availability
+    for over, expected in [
+        ({"source_firm_id": ["B"]}, "FAILED_SOURCE_LINEAGE_INCONSISTENT"),
+        ({"source_fiscal_year": [2018]}, "FAILED_SOURCE_LINEAGE_INCONSISTENT"),
+        ({"source_column": ["lnst_post"]}, "FAILED_SOURCE_LINEAGE_INCONSISTENT"),
+        ({"availability_date": ["2020-04-20"]}, "FAILED_TEMPORAL_LEAKAGE"),
+        ({"availability_date": [None]}, "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"),
+    ]:
+        r = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": _lag_df(**over)}, name="fs_aud_profit_lag1")
+        assert r["status"] == expected, (over, r)
+
+
+def test_scan_feature_names_boundary_and_exact_allowlist():
+    # Old implementation returned [] for all three (substring allowlist / exact-only forbidden names)
+    assert set(hta_ref.scan_feature_names(["pat_post_over_assets", "delta_zero_adj_lag1", "is_zero_adj_lag1"])) == {
+        "pat_post_over_assets", "delta_zero_adj_lag1", "is_zero_adj_lag1"}
+    # Legitimate names are not falsely flagged
+    assert hta_ref.scan_feature_names(["d_roa", "dividend_pre", "fixed_assets_pre", "debt_pre", "depreciation_pre"]) == []
+
+
+def test_provenance_does_not_reject_d_roa_but_never_returns_passed():
+    meta = {"source_columns": ["d_roa"], "formula": "d_roa", "temporal_status": "t_pre",
+            "reporting_scope": "pre_audit", "publication_date": "2020-03-15"}
+    res = hta_ref.verify_feature_provenance("d_roa", meta, prediction_cutoff=_CUTOFF)
+    assert res["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    assert res["status"] != "PASSED"
 
 
 def test_near_zero_temporal_fold_isolation_and_final_edges():
