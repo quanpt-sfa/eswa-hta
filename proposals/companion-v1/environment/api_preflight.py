@@ -173,12 +173,32 @@ def probe_api_compatibility(
             "status": "BLOCKED_APPROVED_CHECKPOINT_OR_HASH_MISSING"
         }
 
+    # 6. Hardware & Memory Runtime Probe
+    try:
+        import torch
+        cuda_avail = torch.cuda.is_available()
+        device_name = torch.cuda.get_device_name(0) if cuda_avail else "CPU"
+        vram_gb = round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 2) if cuda_avail else 0.0
+        # Per §2 D13 and preflight contract: RTX 3060 12GB feasibility remains unverified until inference execution passes
+        report["components"]["HardwareRuntime"] = {
+            "status": "BLOCKED_INFERENCE_MEMORY_UNVERIFIED",
+            "cuda_available": cuda_avail,
+            "device_name": device_name,
+            "total_vram_gb": vram_gb,
+            "feasibility_note": "GPU detected; memory feasibility of TabICLv2 configuration remains unverified until executable inference passes"
+        }
+    except ImportError as e:
+        report["components"]["HardwareRuntime"] = {
+            "status": "BLOCKED_IMPORT_ERROR",
+            "error": str(e)
+        }
+
     # Evaluate Overall Status
     statuses = [v.get("status") for v in report["components"].values()]
     if all(s == "PASSED" for s in statuses):
         report["status"] = "ALL_PROBES_PASSED"
     elif any(isinstance(s, str) and "BLOCKED" in s for s in statuses):
-        report["status"] = "BLOCKED_DEPENDENCIES_UNINSTALLED"
+        report["status"] = "BLOCKED_DEPENDENCIES_OR_CHECKPOINT_UNVERIFIED"
     else:
         report["status"] = "PROBES_FAILED"
 

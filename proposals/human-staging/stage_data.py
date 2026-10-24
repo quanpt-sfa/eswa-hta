@@ -7,9 +7,11 @@ Status: HUMAN_STEWARD_TOOL (NOT FOR AUTONOMOUS AGENT RUNTIME EXECUTION)
 This script is designed to be executed solely by a trusted human data steward
 to physically split master financial statement data into:
   1. Development source (FY2015-2022) with development outcomes.
-  2. Candidate test features (FY2023-2025) with post-audit outcomes strictly redacted.
+  2. Candidate test features (FY2023-2025) constructed strictly via positive selection
+     from a human-approved feature allowlist.
   3. Sealed test outcomes (FY2023-2025) stored in secure, agent-inaccessible storage.
-  4. Cryptographic SHA-256 manifests and human staging receipts.
+  4. Cryptographic SHA-256 manifests and human staging receipts distinguishing
+     file creation from OS-level access isolation.
 """
 
 import argparse
@@ -39,6 +41,7 @@ FORBIDDEN_OUTCOME_COLUMNS = [
 ]
 
 REQUIRED_KEYS = ["firm_id", "fiscal_year", "scope"]
+REQUIRED_TARGET_INPUTS = ["pat_pre", "pat_post", "total_assets_pre"]
 
 
 def compute_sha256(filepath: Path) -> str:
@@ -67,6 +70,22 @@ def audit_test_features_sanitization(df: pd.DataFrame) -> List[str]:
     return found
 
 
+def verify_agent_access_denial(protected_path: Path) -> bool:
+    """
+    Verifies that the coding agent's execution identity cannot read the protected path.
+    Returns True ONLY if reading raises PermissionError.
+    Returns False if readable or if an unexpected state occurs.
+    """
+    try:
+        with open(protected_path, "rb") as f:
+            f.read(1)
+        return False  # Isolation breach: file was readable!
+    except PermissionError:
+        return True   # OS-level access denied
+    except Exception:
+        return False
+
+
 def stage_holdout_data(
     master_path: Path,
     output_dev_path: Path,
@@ -80,6 +99,8 @@ def stage_holdout_data(
 ) -> Tuple[str, str, str]:
     """
     Executes physical holdout separation and writes verification metadata.
+    Enforces positive selection, primary-key uniqueness, fiscal-year bounds,
+    and distinct path requirements.
     """
     if not master_path.exists():
         raise FileNotFoundError(f"Master dataset not found: {master_path}")
@@ -87,12 +108,27 @@ def stage_holdout_data(
     # Load master data
     df = pd.read_parquet(master_path) if master_path.suffix == ".parquet" else pd.read_csv(master_path)
 
+    # 1. Primary Keys Check
     for k in REQUIRED_KEYS:
         if k not in df.columns:
             raise KeyError(f"Required key '{k}' missing from master dataset")
 
-    # Must be explicitly approved by the human data steward. A denylist alone
-    # cannot identify unknown target-derived source columns (fs_aud_*, etc.).
+    if df.duplicated(subset=REQUIRED_KEYS).any():
+        n_dups = int(df.duplicated(subset=REQUIRED_KEYS).sum())
+        raise ValueError(f"Duplicate primary key ({REQUIRED_KEYS}) detected in master dataset: {n_dups} duplicate rows")
+
+    # 2. Required Target Inputs in Master Check
+    for col in REQUIRED_TARGET_INPUTS:
+        if col not in df.columns:
+            raise KeyError(f"Required target input '{col}' missing from master dataset")
+
+    # 3. Fiscal Year Bounds Check
+    min_year = int(df["fiscal_year"].min())
+    max_year = int(df["fiscal_year"].max())
+    if min_year < 2015 or max_year > 2025:
+        raise ValueError(f"Unexpected fiscal year range in master dataset: [{min_year}, {max_year}], expected within [2015, 2025]")
+
+    # 4. Human-Approved Allowlist Check (Positive Selection)
     if not approved_test_feature_columns:
         raise ValueError("Human-approved test-feature column allowlist is required")
     allowed = list(approved_test_feature_columns)
@@ -103,34 +139,38 @@ def stage_holdout_data(
     missing = sorted(set(allowed) - set(df.columns))
     if missing:
         raise ValueError(f"Approved columns absent from source: {missing}")
+
     forbidden = audit_test_features_sanitization(pd.DataFrame(columns=allowed))
     if forbidden:
         raise ValueError(f"Forbidden output columns in approved allowlist: {forbidden}")
-    if output_sealed_outcomes_path.resolve() == output_test_features_path.resolve():
-        raise ValueError("Sealed outcomes and released test features must have different paths")
-    if output_sealed_outcomes_path.resolve() == output_dev_path.resolve():
-        raise ValueError("Sealed outcomes and development data must have different paths")
 
-    # 1. Development Split (FY <= dev_max_year)
+    # 5. Path Distinctness Checks
+    p_dev = output_dev_path.resolve()
+    p_test = output_test_features_path.resolve()
+    p_sealed = output_sealed_outcomes_path.resolve()
+    if p_sealed == p_test or p_sealed == p_dev or p_dev == p_test:
+        raise ValueError("Output paths for dev, test features, and sealed outcomes must all be distinct")
+
+    # 6. Development Split (FY <= dev_max_year)
     dev_df = df[df["fiscal_year"] <= dev_max_year].copy()
     output_dev_path.parent.mkdir(parents=True, exist_ok=True)
     dev_df.to_parquet(output_dev_path, index=False)
     dev_hash = compute_sha256(output_dev_path)
 
-    # 2. Test Split (FY >= test_min_year)
+    # 7. Test Split (FY >= test_min_year)
     test_raw = df[df["fiscal_year"] >= test_min_year].copy()
 
-    # 3. Sealed Outcomes (FY >= test_min_year)
-    outcome_cols = [c for c in test_raw.columns if c in REQUIRED_KEYS or c in FORBIDDEN_OUTCOME_COLUMNS or c in ["pat_pre", "total_assets_pre"]]
+    # 8. Sealed Outcomes (FY >= test_min_year)
+    outcome_cols = [c for c in test_raw.columns if c in REQUIRED_KEYS or c in FORBIDDEN_OUTCOME_COLUMNS or c in REQUIRED_TARGET_INPUTS]
     sealed_df = test_raw[outcome_cols].copy()
     output_sealed_outcomes_path.parent.mkdir(parents=True, exist_ok=True)
     sealed_df.to_parquet(output_sealed_outcomes_path, index=False)
     sealed_hash = compute_sha256(output_sealed_outcomes_path)
 
-    # 4. Sanitized Test Features (Remove all outcomes)
+    # 9. Sanitized Test Features (Strict positive selection from allowlist)
     test_features_df = test_raw[allowed].copy()
 
-    # Redaction assertion
+    # Sanitization assertion
     violations = audit_test_features_sanitization(test_features_df)
     if violations:
         raise ValueError(f"CRITICAL LEAKAGE: Sanitized test features contain forbidden outcome columns: {violations}")
@@ -139,17 +179,28 @@ def stage_holdout_data(
     test_features_df.to_parquet(output_test_features_path, index=False)
     test_features_hash = compute_sha256(output_test_features_path)
 
-    # 5. Write Checksum Manifest
+    # 10. Write Checksum Manifest
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(manifest_path, "w", encoding="utf-8") as f:
         f.write(f"{dev_hash}  {output_dev_path.name}\n")
         f.write(f"{test_features_hash}  {output_test_features_path.name}\n")
 
-    # 6. Generate Staging Receipt
+    # 11. Generate Staging Receipt
     receipt_content = f"""# Staged Holdout Human Receipt
 Date: {pd.Timestamp.now().isoformat()}
 Steward Identity: Human Data Steward (Automated Tool Generation)
 Master Source: {master_path.name}
+
+## Positive-Selection Feature Allowlist
+- Human Approval: Verified against explicit allowlist ({len(allowed)} columns)
+- Sanitization Scan: Passed (0 forbidden tokens found)
+
+## Verification Checklist
+- [x] 1. Files successfully created
+- [x] 2. Required schema checks passed
+- [x] 3. Outcome columns excluded (Positive selection allowlist enforced)
+- [ ] 4. OS-level access isolation verified (Requires independent agent permission-denial probe)
+- [ ] 5. Human approval completed (Requires human steward signature)
 
 ## Staged Artifacts
 1. Development Source:
@@ -170,7 +221,8 @@ Master Source: {master_path.name}
    - Rows: {len(sealed_df)}
    - SHA-256: {sealed_hash}
 
-Status: STAGING_OUTPUTS_CREATED__ACCESS_ISOLATION_UNVERIFIED\nHuman sign-off required after permission-denial probe.
+Status: STAGING_OUTPUTS_CREATED__ACCESS_ISOLATION_UNVERIFIED
+Human sign-off required after independent OS-level access-denial probe.
 """
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     with open(receipt_path, "w", encoding="utf-8") as f:

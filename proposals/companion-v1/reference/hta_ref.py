@@ -1,5 +1,5 @@
 """
-HTA Reference Implementation (Candidate v1.0)
+HTA Reference Implementation (Candidate v1.1)
 =============================================
 Repository: quanpt-sfa/eswa-hta
 Governance: docs/HTA_IMPLEMENTATION_SPEC_v1.2.md (§15.1, Rule A3)
@@ -11,26 +11,40 @@ research pipeline, including:
   2. Multi-quantile probability exceedance (exceedance_prob)
   3. Hurdle mixture exceedance (hurdle_exceedance)
   4. Analytic distribution exceedance (scipy_exceedance)
-  5. Post-audit denominator asymmetric cuts (asymmetric_post_cuts)
-  6. Two-sided exceedance probability (two_sided_exceedance)
-  7. Multi-threshold expansion (threshold_expansion)
+  5. Post-audit denominator asymmetric cuts (post_denominator_cuts / asymmetric_post_cuts)
+  6. Two-sided exceedance probability (two_sided_prob / two_sided_exceedance)
+  7. Multi-threshold expansion (expand_thresholds / threshold_expansion)
   8. Expanding-window temporal folds (temporal_expanding_folds)
-  9. Paired firm-cluster bootstrap (paired_firm_cluster_bootstrap)
- 10. Near-zero earnings binning (near_zero_bins)
- 11. Distributional and classification metrics (evaluate_predictions)
- 12. Feature leakage and point-in-time guards (check_feature_leakage, check_point_in_time)
- 13. Target transformations (target_transform, inverse_target_transform)
- 14. Distributional loss / CRPS (crps_score)
+  9. Paired firm-cluster bootstrap (paired_cluster_bootstrap / paired_firm_cluster_bootstrap)
+ 10. Near-zero earnings binning (near_zero_edges, assign_bins, near_zero_bins)
+ 11. Prediction evaluation metrics (ap, compute_average_precision, compute_brier_score, compute_ece, precision_recall_at_k, evaluate_predictions)
+ 12. Feature leakage and point-in-time guards (check_feature_leakage, check_point_in_time, scan_feature_names, numeric_leak_check)
+ 13. Fold integrity validation (assert_fold_integrity)
+ 14. Target transformations (target_transform, inverse_target_transform)
+ 15. Distributional loss and CRPS (crps_from_quantiles / crps_score, pinball_loss)
 
 Under Rule A3, this candidate implementation must be independently audited,
 verified against golden fixtures, and signed off before being promoted to
 the authoritative production location `reference/hta_ref.py`.
 """
 
+import math
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 from scipy import stats
+
+
+# Unresolved official TabICL alpha vector until G0 API preflight passes (§2 D13, §15.3)
+TABICL_RAW_ALPHAS: Optional[Sequence[float]] = None
+
+DEFAULT_LEAKAGE_ALLOWLIST = [
+    "y_k050_lag1",
+    "zero_adj_lag1",
+    "D_lag1",
+    "n_pos_past",
+    "n_obs_past",
+]
 
 
 # ==============================================================================
@@ -39,9 +53,9 @@ from scipy import stats
 
 def build_labels(
     df: pd.DataFrame,
-    pat_pre_col: str = "pat_pre",
-    pat_post_col: str = "pat_post",
-    total_assets_pre_col: str = "total_assets_pre",
+    pat_pre_col: Union[str, Sequence[float], pd.Series] = "pat_pre",
+    pat_post_col: Union[str, Sequence[float], pd.Series] = "pat_post",
+    total_assets_pre_col: Union[str, Sequence[float], pd.Series] = "total_assets_pre",
     ks: Sequence[float] = (0.05, 0.075, 0.10, 0.15, 0.20),
     zero_tol: float = 0.0
 ) -> pd.DataFrame:
@@ -53,12 +67,12 @@ def build_labels(
     ----------
     df : pd.DataFrame
         Input dataframe containing pre-audit, post-audit PAT, and pre-audit assets.
-    pat_pre_col : str
-        Column name for unaudited pre-audit profit after tax (PAT_pre).
-    pat_post_col : str
-        Column name for audited post-audit profit after tax (PAT_post).
-    total_assets_pre_col : str
-        Column name for pre-audit total assets.
+    pat_pre_col : Union[str, Sequence[float], pd.Series]
+        Column name or Series for unaudited pre-audit profit after tax (PAT_pre).
+    pat_post_col : Union[str, Sequence[float], pd.Series]
+        Column name or Series for audited post-audit profit after tax (PAT_post).
+    total_assets_pre_col : Union[str, Sequence[float], pd.Series]
+        Column name or Series for pre-audit total assets.
     ks : Sequence[float]
         Registered materiality thresholds (default: 0.05, 0.075, 0.10, 0.15, 0.20).
     zero_tol : float
@@ -70,6 +84,7 @@ def build_labels(
         A dataframe with canonical outcome and label columns:
         - delta: PAT_post - PAT_pre
         - D: delta / total_assets_pre
+        - q: |PAT_pre| / total_assets_pre
         - is_zero_adj: (|delta| <= zero_tol)
         - eligible_label: True if both PAT present, PAT_pre != 0, and PAT_pre * PAT_post >= 0
         - eligible_model: eligible_label and total_assets_pre > 0
@@ -81,15 +96,27 @@ def build_labels(
         - boundary_case: True if eligible_label and ||delta|/|PAT_pre| - k| < 1e-9 for any k
     """
     out = pd.DataFrame(index=df.index)
-    pat_pre = df[pat_pre_col].astype(float)
-    pat_post = df[pat_post_col].astype(float)
-    assets = df[total_assets_pre_col].astype(float)
+
+    if isinstance(pat_pre_col, str):
+        pat_pre = df[pat_pre_col].astype(float)
+    else:
+        pat_pre = pd.Series(pat_pre_col, index=df.index, dtype=float)
+
+    if isinstance(pat_post_col, str):
+        pat_post = df[pat_post_col].astype(float)
+    else:
+        pat_post = pd.Series(pat_post_col, index=df.index, dtype=float)
+
+    if isinstance(total_assets_pre_col, str):
+        assets = df[total_assets_pre_col].astype(float)
+    else:
+        assets = pd.Series(total_assets_pre_col, index=df.index, dtype=float)
 
     # Basic adjustments
     delta = pat_post - pat_pre
     out["delta"] = delta
     
-    # Scale D by total assets (avoid division by non-positive or zero assets)
+    # Scale D and q by total assets (avoid division by non-positive or zero assets)
     with np.errstate(divide="ignore", invalid="ignore"):
         out["D"] = np.where(assets > 0, delta / assets, np.nan)
         out["q"] = np.where(assets > 0, np.abs(pat_pre) / assets, np.nan)
@@ -305,24 +332,29 @@ def scipy_exceedance(dist, c: Union[float, np.ndarray]) -> np.ndarray:
 
 
 # ==============================================================================
-# 5. Asymmetric Post-Denominator Cuts (§15.2 T-P01, T-P02)
+# 5. Post-Audit Denominator Asymmetric Cuts (§15.2 T-P01, T-P02, §9.3 R1)
 # ==============================================================================
 
-def asymmetric_post_cuts(
+def post_denominator_cuts(
     pat_pre: Union[float, np.ndarray],
-    k: float = 0.05
+    k: float = 0.05,
+    total_assets_pre: Optional[Union[float, np.ndarray]] = None
 ) -> Tuple[Union[float, np.ndarray], Union[float, np.ndarray]]:
     """
-    Computes asymmetric adjustment cuts on Delta scale when the materiality
-    threshold is defined relative to post-audit earnings |Delta / PAT_post| >= k.
+    Computes asymmetric adjustment cuts on Delta scale (or D scale) when the
+    materiality threshold is defined relative to post-audit earnings |Delta / PAT_post| >= k.
 
-    Derivation:
+    Algebraic Derivation:
       Case 1: PAT_pre > 0
-        lower_cut = -k / (1 + k) * PAT_pre
-        upper_cut = +k / (1 - k) * PAT_pre
-      Case 2: PAT_pre < 0
-        lower_cut = -k / (1 - k) * |PAT_pre|
-        upper_cut = +k / (1 + k) * |PAT_pre|
+        Delta_lower = -k / (1 + k) * PAT_pre
+        Delta_upper = +k / (1 - k) * PAT_pre
+      Case 2: PAT_pre < 0 (Pre-audit loss)
+        Delta_lower = -k / (1 - k) * |PAT_pre|
+        Delta_upper = +k / (1 + k) * |PAT_pre|
+
+    If total_assets_pre is supplied, cuts are normalized to the D scale:
+      D_lower = Delta_lower / total_assets_pre
+      D_upper = Delta_upper / total_assets_pre
 
     Parameters
     ----------
@@ -330,11 +362,13 @@ def asymmetric_post_cuts(
         Pre-audit earnings.
     k : float
         Materiality threshold fraction (0 < k < 1).
+    total_assets_pre : Optional[Union[float, np.ndarray]]
+        Pre-audit total assets. If provided, returns cuts normalized by assets.
 
     Returns
     -------
     Tuple[lower_cut, upper_cut]
-        The lower and upper Delta cut values.
+        The lower and upper cut values.
     """
     if not (0.0 < k < 1.0):
         raise ValueError(f"k must be in (0, 1), got {k}")
@@ -362,28 +396,173 @@ def asymmetric_post_cuts(
     lower[zero_mask] = np.nan
     upper[zero_mask] = np.nan
 
+    if total_assets_pre is not None:
+        assets_arr = np.asarray(total_assets_pre, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            lower = np.where(assets_arr > 0, lower / assets_arr, np.nan)
+            upper = np.where(assets_arr > 0, upper / assets_arr, np.nan)
+
     if is_scalar:
         return float(lower), float(upper)
     return lower, upper
 
+# Canonical alias
+asymmetric_post_cuts = post_denominator_cuts
+
 
 # ==============================================================================
-# 6. Two-Sided Exceedance Function
+# 6. Two-Sided Exceedance Function (§15.2 T-C01, §9.3 R1)
 # ==============================================================================
 
-def two_sided_exceedance(cdf_func, c: float) -> float:
+def two_sided_prob(
+    dist_or_cdf,
+    c: Optional[float] = None,
+    lower_cutoff: Optional[float] = None,
+    upper_cutoff: Optional[float] = None
+) -> float:
     """
-    Computes P(|X| >= c) given an arbitrary continuous CDF function F(x):
+    Computes two-sided exceedance probability for symmetric or asymmetric cutoffs.
+
+    If c is provided (symmetric threshold on absolute value):
       P(|X| >= c) = F(-c) + (1 - F(c))
+    If lower_cutoff and upper_cutoff are provided (asymmetric):
+      P(X <= lower_cutoff or X >= upper_cutoff) = F(lower_cutoff) + (1 - F(upper_cutoff))
+
+    Parameters
+    ----------
+    dist_or_cdf : callable or distribution object with .cdf() and optionally .sf()
+    c : Optional[float]
+    lower_cutoff : Optional[float]
+    upper_cutoff : Optional[float]
+
+    Returns
+    -------
+    float
+        Probability in [0, 1].
     """
-    if c < 0:
-        raise ValueError("c must be non-negative")
-    return float(cdf_func(-c) + (1.0 - cdf_func(c)))
+    if c is not None:
+        if c < 0:
+            raise ValueError("Symmetric cutoff c must be non-negative")
+        lower_cut = -float(c)
+        upper_cut = float(c)
+    elif lower_cutoff is not None and upper_cutoff is not None:
+        lower_cut = float(lower_cutoff)
+        upper_cut = float(upper_cutoff)
+    else:
+        raise ValueError("Must provide either symmetric 'c' or both 'lower_cutoff' and 'upper_cutoff'")
+
+    if hasattr(dist_or_cdf, "cdf"):
+        cdf_fn = dist_or_cdf.cdf
+        sf_fn = getattr(dist_or_cdf, "sf", lambda x: 1.0 - cdf_fn(x))
+        p_lower = float(cdf_fn(lower_cut))
+        p_upper = float(sf_fn(upper_cut))
+    elif callable(dist_or_cdf):
+        p_lower = float(dist_or_cdf(lower_cut))
+        p_upper = float(1.0 - dist_or_cdf(upper_cut))
+    else:
+        raise TypeError("dist_or_cdf must be a callable or distribution object with .cdf()")
+
+    return float(np.clip(p_lower + p_upper, 0.0, 1.0))
+
+# Canonical alias
+two_sided_exceedance = two_sided_prob
 
 
 # ==============================================================================
-# 7. Multi-Threshold Expansion (§2 D06)
+# 7. Multi-Threshold Expansion (§2 D06, §6.2, §8.3 B3b)
 # ==============================================================================
+
+def expand_thresholds(
+    df: pd.DataFrame,
+    ks: Sequence[float] = (0.05, 0.10, 0.20),
+    pat_pre_col: str = "pat_pre",
+    total_assets_pre_col: str = "total_assets_pre",
+    delta_col: Optional[str] = "delta",
+    y_col_prefix: Optional[str] = "y_k",
+    weight_col: Optional[str] = None,
+    id_col: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Expands training observations into long-format across multiple materiality
+    thresholds k for threshold-conditioned models (B3b) per §2 D06, §6.2, §8.3.
+
+    Each original firm-year observation is replicated len(ks) times:
+      - Threshold k
+      - Observation-specific c_k = k * |PAT_pre| / total_assets_pre
+      - Binary label y at threshold k: 1 if |delta| >= k * |PAT_pre|, else 0
+      - Sample weight: original_weight / len(ks), controlling combined training influence
+      - Source row identifier (source_row_id)
+      - Retains original firm-year identifiers and fold assignment
+
+    Evaluation thresholds (0.075, 0.15) remain held-out per registered protocol.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Original training dataframe.
+    ks : Sequence[float]
+        Registered training thresholds (default: 0.05, 0.10, 0.20).
+    pat_pre_col : str
+    total_assets_pre_col : str
+    delta_col : Optional[str]
+    y_col_prefix : Optional[str]
+    weight_col : Optional[str]
+    id_col : Optional[str]
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-format dataframe containing expanded observations.
+    """
+    if len(df) == 0:
+        return pd.DataFrame()
+
+    n_thresholds = len(ks)
+    if n_thresholds == 0:
+        raise ValueError("Thresholds sequence ks cannot be empty")
+
+    pat_abs = df[pat_pre_col].abs().astype(float)
+    assets = df[total_assets_pre_col].astype(float)
+
+    # Base weight per observation
+    if weight_col and weight_col in df.columns:
+        base_weights = df[weight_col].astype(float)
+    else:
+        base_weights = pd.Series(1.0, index=df.index, dtype=float)
+
+    # Base row identifier
+    if id_col and id_col in df.columns:
+        row_ids = df[id_col]
+    else:
+        row_ids = pd.Series(df.index, index=df.index)
+
+    chunks = []
+    for k in ks:
+        chunk = df.copy()
+        tag = f"{int(round(k * 1000)):03d}"
+        
+        chunk["k"] = float(k)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            chunk["c_k"] = np.where(assets > 0, (k * pat_abs) / assets, np.nan)
+
+        # Label resolution
+        col_y_name = f"{y_col_prefix}{tag}"
+        if col_y_name in df.columns:
+            chunk["y"] = df[col_y_name].astype(int)
+        elif delta_col and delta_col in df.columns:
+            abs_delta = df[delta_col].abs().astype(float)
+            chunk["y"] = (abs_delta >= (k * pat_abs)).astype(int)
+        else:
+            chunk["y"] = np.nan
+
+        # Controlled weight
+        chunk["sample_weight"] = base_weights / n_thresholds
+        chunk["source_row_id"] = row_ids
+        chunks.append(chunk)
+
+    long_df = pd.concat(chunks, axis=0, ignore_index=True)
+    return long_df
+
 
 def threshold_expansion(
     df: pd.DataFrame,
@@ -392,8 +571,7 @@ def threshold_expansion(
     ks: Sequence[float] = (0.05, 0.075, 0.10, 0.15, 0.20)
 ) -> pd.DataFrame:
     """
-    Computes the D-scale thresholds c_k = k * |PAT_pre| / total_assets_pre
-    for each observation and each registered k.
+    Wide-format threshold expansion: computes D-scale thresholds c_k = k * |PAT_pre| / assets.
     """
     res = pd.DataFrame(index=df.index)
     pat_abs = df[pat_pre_col].abs().astype(float)
@@ -442,6 +620,84 @@ def temporal_expanding_folds(
     return folds
 
 
+def assert_fold_integrity(
+    folds: Sequence[Tuple[np.ndarray, np.ndarray]],
+    df: pd.DataFrame,
+    year_col: str = "fiscal_year",
+    firm_col: Optional[str] = "firm_id"
+) -> bool:
+    """
+    Verifies temporal expanding-window fold integrity (§2 D10, §5 G4):
+      1. Exactly 4 development folds (F1-F4) or specified sequence.
+      2. Non-empty train and validation indices in every fold.
+      3. No index overlap between train and validation within any fold.
+      4. Strict temporal precedence: max(train_year) < min(val_year).
+      5. Strictly increasing validation years across successive folds.
+      6. No validation firm-year observation leaks into training fold.
+
+    Raises
+    ------
+    AssertionError
+        If any fold integrity invariant is violated.
+
+    Returns
+    -------
+    bool
+        True if all invariants hold.
+    """
+    if len(folds) == 0:
+        raise AssertionError("Folds sequence is empty")
+
+    years = df[year_col].to_numpy()
+    prev_val_year = -float("inf")
+
+    for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        fold_num = fold_idx + 1
+        if len(train_idx) == 0:
+            raise AssertionError(f"Fold F{fold_num} has empty train set")
+        if len(val_idx) == 0:
+            raise AssertionError(f"Fold F{fold_num} has empty validation set")
+
+        # No index overlap
+        overlap = np.intersect1d(train_idx, val_idx)
+        if len(overlap) > 0:
+            raise AssertionError(f"Fold F{fold_num} has {len(overlap)} overlapping indices between train and val")
+
+        train_years = years[train_idx]
+        val_years = years[val_idx]
+
+        max_train_year = train_years.max()
+        min_val_year = val_years.min()
+        max_val_year = val_years.max()
+
+        if min_val_year != max_val_year:
+            raise AssertionError(f"Fold F{fold_num} validation set spans multiple years: {min_val_year} to {max_val_year}")
+
+        if max_train_year >= min_val_year:
+            raise AssertionError(
+                f"Fold F{fold_num} temporal violation: max train year ({max_train_year}) >= "
+                f"min validation year ({min_val_year})"
+            )
+
+        if min_val_year <= prev_val_year:
+            raise AssertionError(
+                f"Fold F{fold_num} validation year ({min_val_year}) is not strictly greater than "
+                f"previous fold validation year ({prev_val_year})"
+            )
+        prev_val_year = min_val_year
+
+        # Firm-year leak check if firm_col present
+        if firm_col and firm_col in df.columns:
+            firms = df[firm_col].to_numpy()
+            train_keys = set(zip(firms[train_idx], train_years))
+            val_keys = set(zip(firms[val_idx], val_years))
+            key_overlap = train_keys.intersection(val_keys)
+            if key_overlap:
+                raise AssertionError(f"Fold F{fold_num} has leaking firm-year keys: {key_overlap}")
+
+    return True
+
+
 # ==============================================================================
 # 9. Paired Firm-Cluster Bootstrap (§2 D20, §15.2 T-B01)
 # ==============================================================================
@@ -452,7 +708,7 @@ def paired_firm_cluster_bootstrap(
     score_a: Sequence[float],
     score_b: Sequence[float],
     y_true: Sequence[int],
-    metric_fn,
+    metric_fn=None,
     n_boot: int = 1000,
     seed: int = 42,
     alpha: float = 0.05
@@ -462,6 +718,9 @@ def paired_firm_cluster_bootstrap(
     Resamples FIRMS with replacement, retaining all firm-year observations for
     selected firms to preserve within-cluster temporal correlation.
     """
+    if metric_fn is None:
+        metric_fn = compute_average_precision
+
     rng = np.random.default_rng(seed)
     
     firm_ids = df[firm_col].to_numpy()
@@ -498,6 +757,7 @@ def paired_firm_cluster_bootstrap(
     valid_diffs = diffs[np.isfinite(diffs)]
     if len(valid_diffs) < 2:
         raise ValueError("Insufficient valid firm-cluster bootstrap replications")
+
     ci_lower = float(np.percentile(valid_diffs, 100 * (alpha / 2)))
     ci_upper = float(np.percentile(valid_diffs, 100 * (1 - alpha / 2)))
 
@@ -512,9 +772,90 @@ def paired_firm_cluster_bootstrap(
     }
 
 
+def paired_cluster_bootstrap(
+    df: pd.DataFrame,
+    firm_col: str,
+    score_a: Sequence[float],
+    score_b: Sequence[float],
+    y_true: Sequence[int],
+    metric=None,
+    metric_fn=None,
+    n_boot: int = 1000,
+    seed: int = 42,
+    alpha: float = 0.05
+) -> Dict[str, float]:
+    """Canonical alias matching specification calling contract."""
+    fn = metric if metric is not None else metric_fn
+    return paired_firm_cluster_bootstrap(
+        df=df,
+        firm_col=firm_col,
+        score_a=score_a,
+        score_b=score_b,
+        y_true=y_true,
+        metric_fn=fn,
+        n_boot=n_boot,
+        seed=seed,
+        alpha=alpha
+    )
+
+
 # ==============================================================================
-# 10. Near-Zero Earnings Bins (§2 D22)
+# 10. Near-Zero Earnings Bins (§2 D22, §5 G4)
 # ==============================================================================
+
+def near_zero_edges(
+    q: Union[Sequence[float], np.ndarray, pd.Series],
+    n_bins: int = 5
+) -> np.ndarray:
+    """
+    Computes quantile bin edges on development eligible_model observations
+    of q = |PAT_pre| / assets (§2 D22, §5 G4).
+
+    Parameters
+    ----------
+    q : Union[Sequence[float], np.ndarray, pd.Series]
+        Development eligible_model values of q.
+    n_bins : int
+        Number of quantile bins (default: 5 quintiles).
+
+    Returns
+    -------
+    np.ndarray
+        Array of length n_bins + 1 containing bin edges starting at -inf and ending at +inf.
+    """
+    q_arr = np.asarray(q, dtype=float)
+    q_valid = q_arr[np.isfinite(q_arr)]
+    if len(q_valid) == 0 or n_bins < 2:
+        raise ValueError("near_zero_edges requires finite, nonempty data and n_bins >= 2")
+
+    quantiles = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_edges = np.percentile(q_valid, quantiles * 100)
+    if np.any(np.diff(bin_edges) <= 0):
+        raise ValueError(
+            f"Quantile bin edges are tied ({bin_edges}); "
+            "request a pre-registered binning fallback or discrete edge policy"
+        )
+    bin_edges[0] = -np.inf
+    bin_edges[-1] = np.inf
+    return bin_edges
+
+
+def assign_bins(
+    q: Union[Sequence[float], np.ndarray, pd.Series],
+    edges: np.ndarray
+) -> pd.Series:
+    """
+    Assigns near-zero bin indices [0..len(edges)-2] using frozen edges (§2 D22).
+    Does NOT recompute quantile edges on test or validation data.
+    """
+    edges_arr = np.asarray(edges, dtype=float)
+    if len(edges_arr) < 3 or np.any(np.diff(edges_arr) <= 0):
+        raise ValueError("Invalid edges array: must have at least 3 strictly increasing elements")
+
+    q_series = pd.Series(q) if not isinstance(q, pd.Series) else q
+    bins = pd.cut(q_series, bins=edges_arr, labels=False, include_lowest=True)
+    return bins
+
 
 def near_zero_bins(
     df: pd.DataFrame,
@@ -523,33 +864,25 @@ def near_zero_bins(
     eligible_col: str = "eligible_model"
 ) -> Tuple[pd.Series, np.ndarray]:
     """
-    Computes quintiles of q = |PAT_pre| / assets on development eligible_model
-    rows with fixed edges, returning assigned bin IDs [0..n_bins-1] and edges.
+    Legacy wrapper: computes quintiles of q on eligible development rows
+    and assigns bins to all rows in df.
     """
     eligible_mask = df[eligible_col].fillna(False).astype(bool)
     dev_q = df.loc[eligible_mask, q_col].dropna()
-    if n_bins < 2 or dev_q.empty or not np.isfinite(dev_q.to_numpy(dtype=float)).all():
-        raise ValueError("Near-zero bins need finite, nonempty development data and n_bins >= 2")
-    quantiles = np.linspace(0, 1, n_bins + 1)
-    bin_edges = np.percentile(dev_q, quantiles * 100)
-    if np.any(np.diff(bin_edges) <= 0):
-        raise ValueError("Quantile bin edges are tied; request a pre-registered binning fallback")
-    bin_edges[0] = -np.inf
-    bin_edges[-1] = np.inf
-
-    bin_ids = pd.cut(df[q_col], bins=bin_edges, labels=False, include_lowest=True)
-    return bin_ids, bin_edges
+    edges = near_zero_edges(dev_q, n_bins=n_bins)
+    bin_ids = assign_bins(df[q_col], edges)
+    return bin_ids, edges
 
 
 # ==============================================================================
-# 11. Prediction Evaluation Metrics (§2 D20, D23)
+# 11. Prediction Evaluation Metrics (§2 D20, D23, §9.1)
 # ==============================================================================
 
 def compute_average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Average Precision with score-tie handling identical to sklearn.
-
-    All examples with identical prediction scores form one precision-recall
-    step; arbitrary row order must not affect the result.
+    """
+    Average Precision with score-tie handling identical to sklearn.metrics.average_precision_score.
+    All examples with identical prediction scores form one precision-recall step;
+    arbitrary input row order does not alter the result.
     """
     from sklearn.metrics import average_precision_score
 
@@ -564,6 +897,9 @@ def compute_average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
     if np.unique(y_true).size < 2:
         return float("nan")
     return float(average_precision_score(y_true, y_score))
+
+# Canonical alias
+ap = compute_average_precision
 
 
 def compute_brier_score(y_true: np.ndarray, y_prob: np.ndarray) -> float:
@@ -591,6 +927,55 @@ def compute_ece(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> flo
     return float(ece)
 
 
+def precision_recall_at_k(
+    y_true: Sequence[int],
+    y_score: Sequence[float],
+    k_budget: float
+) -> Tuple[float, float]:
+    """
+    Computes Precision@K and Recall@K at screening budget fraction k_budget (§2 D21, §9.1).
+
+    Parameters
+    ----------
+    y_true : Sequence[int]
+        Binary ground-truth labels {0, 1}.
+    y_score : Sequence[float]
+        Predicted risk probabilities or scores.
+    k_budget : float
+        Screening budget fraction in (0, 1], e.g. 0.05 or 0.10.
+
+    Returns
+    -------
+    Tuple[precision, recall]
+    """
+    y_t = np.asarray(y_true, dtype=int)
+    y_s = np.asarray(y_score, dtype=float)
+
+    if len(y_t) != len(y_s):
+        raise ValueError("y_true and y_score must have equal length")
+    if not (0.0 < k_budget <= 1.0):
+        raise ValueError(f"k_budget must be in (0, 1], got {k_budget}")
+
+    n = len(y_t)
+    if n == 0:
+        return 0.0, 0.0
+
+    m = int(math.ceil(k_budget * n))
+    m = min(m, n)
+
+    # Sort descending by score stably
+    order = np.argsort(-y_s, kind="stable")
+    top_indices = order[:m]
+
+    n_pos = int(np.sum(y_t == 1))
+    tp = int(np.sum(y_t[top_indices] == 1))
+
+    precision = tp / m if m > 0 else 0.0
+    recall = tp / n_pos if n_pos > 0 else 0.0
+
+    return float(precision), float(recall)
+
+
 def evaluate_predictions(y_true: Sequence[int], y_prob: Sequence[float]) -> Dict[str, float]:
     """Computes full diagnostic evaluation metrics."""
     yt = np.asarray(y_true, dtype=int)
@@ -605,7 +990,7 @@ def evaluate_predictions(y_true: Sequence[int], y_prob: Sequence[float]) -> Dict
 
 
 # ==============================================================================
-# 12. Feature Leakage & Point-in-Time Guards (§2 D08-D09, §15.2 T-T01)
+# 12. Feature Leakage & Point-in-Time Guards (§2 D08-D09, §5 G2, §15.2 T-T01)
 # ==============================================================================
 
 def check_feature_leakage(
@@ -635,6 +1020,95 @@ def check_point_in_time(
     return res
 
 
+def scan_feature_names(
+    feature_names: Sequence[str],
+    allow: Optional[Sequence[str]] = None
+) -> List[str]:
+    """
+    Scans candidate feature column names for potential post-audit leakage (§2 D08, §5 G2).
+
+    Rules:
+      - Forbidden outcome variables and substrings: 'aud', 'post', 'delta', 'pat_post', 'audit_adj', 'is_zero_adj', 'eligible_'
+      - Allowed: explicit entries in allowlist, or verified lagged variables (e.g. ending in _lag1, _lag2).
+
+    Returns
+    -------
+    List[str]
+        List of flagged feature names. Returns [] if all features are clean.
+    """
+    allowlist = set(DEFAULT_LEAKAGE_ALLOWLIST if allow is None else allow)
+    forbidden_exact = {
+        "pat_post", "delta", "d", "is_zero_adj", "eligible_label", "eligible_model",
+        "usable_pair", "sign_change", "boundary_case"
+    }
+    forbidden_substrings = ["audit_adj", "fs_aud", "post_audit", "audited"]
+
+    flagged = []
+    for col in feature_names:
+        c_lower = str(col).lower()
+        if col in allowlist or c_lower in allowlist:
+            continue
+        # Verified lagged items in allowlist
+        if any(c_lower.endswith(f"_lag{i}") for i in range(1, 10)):
+            if c_lower in allowlist or any(allowed_pat in c_lower for allowed_pat in allowlist):
+                continue
+        # Exact forbidden outcomes
+        if c_lower in forbidden_exact or c_lower.startswith("y_k") or c_lower.startswith("c_k"):
+            flagged.append(col)
+            continue
+        # Forbidden substrings (unless lagged and allowed)
+        if any(sub in c_lower for sub in forbidden_substrings) or c_lower.endswith("_aud") or c_lower.endswith("_post"):
+            flagged.append(col)
+            continue
+
+    return flagged
+
+
+def numeric_leak_check(
+    X_numeric: pd.DataFrame,
+    pat_pre: pd.Series,
+    pat_post: pd.Series,
+    delta: pd.Series,
+    y_k050: pd.Series,
+    corr_threshold: float = 0.99
+) -> pd.DataFrame:
+    """
+    Development-only numeric leakage diagnostics (§5 G2).
+    Calculates Pearson correlation between each numeric predictor and outcome targets.
+    Flags features with near-perfect correlation (|r| >= corr_threshold).
+    Returns diagnostic DataFrame: [feature, target, correlation, suspicious].
+    Does NOT automatically remove features.
+    """
+    targets = {
+        "pat_post": pd.to_numeric(pat_post, errors="coerce"),
+        "delta": pd.to_numeric(delta, errors="coerce"),
+        "y_k050": pd.to_numeric(y_k050, errors="coerce"),
+    }
+
+    records = []
+    for col in X_numeric.columns:
+        s = pd.to_numeric(X_numeric[col], errors="coerce")
+        if s.std(ddof=0) == 0 or s.isna().all():
+            continue
+        for tgt_name, tgt_s in targets.items():
+            valid_mask = s.notna() & tgt_s.notna()
+            if valid_mask.sum() < 5 or tgt_s[valid_mask].std(ddof=0) == 0:
+                continue
+            r = float(np.corrcoef(s[valid_mask], tgt_s[valid_mask])[0, 1])
+            is_suspicious = abs(r) >= corr_threshold
+            records.append({
+                "feature": col,
+                "target": tgt_name,
+                "correlation": r,
+                "suspicious": is_suspicious
+            })
+
+    res_df = pd.DataFrame(records)
+    if res_df.empty:
+        return pd.DataFrame(columns=["feature", "target", "correlation", "suspicious"])
+    return res_df.sort_values(by="correlation", key=abs, ascending=False).reset_index(drop=True)
+
+
 # ==============================================================================
 # 13. Target Transformations (§2 D18)
 # ==============================================================================
@@ -650,7 +1124,7 @@ def inverse_target_transform(Z: np.ndarray, s: float = 1.0) -> np.ndarray:
 
 
 # ==============================================================================
-# 14. Distributional Pinball Loss & CRPS
+# 14. Distributional Pinball Loss & CRPS (§14 Rule 8, §15.2)
 # ==============================================================================
 
 def pinball_loss(y: float, q: float, alpha: float) -> float:
@@ -659,22 +1133,59 @@ def pinball_loss(y: float, q: float, alpha: float) -> float:
     return alpha * err if err >= 0 else (alpha - 1.0) * err
 
 
-def crps_score(y_true: Sequence[float], Q: np.ndarray, alphas: Sequence[float]) -> float:
-    """Approximates continuous ranked probability score via pinball loss integration."""
+def crps_from_quantiles(
+    y_true: Sequence[float],
+    quantiles: np.ndarray,
+    alphas: Sequence[float]
+) -> float:
+    """
+    Computes Continuous Ranked Probability Score (CRPS) from predicted quantiles
+    via numerical trapezoidal pinball loss integration (§14 Rule 8, §15.2).
+
+    Evaluated on the original continuous outcome scale.
+
+    Parameters
+    ----------
+    y_true : Sequence[float]
+        Observed continuous outcome.
+    quantiles : np.ndarray
+        Array of shape (N, M) containing predicted quantiles.
+    alphas : Sequence[float]
+        Quantile levels strictly increasing in (0, 1).
+
+    Returns
+    -------
+    float
+        Mean CRPS across all observations.
+    """
     y_arr = np.asarray(y_true, dtype=float)
-    Q_arr = np.asarray(Q, dtype=float)
+    Q_arr = np.asarray(quantiles, dtype=float)
     alphas_arr = np.asarray(alphas, dtype=float)
 
-    N, M = Q_arr.shape
-    total_crps = 0.0
+    if Q_arr.ndim == 1:
+        Q_arr = Q_arr.reshape(1, -1)
 
-    # Trapezoidal weights for quantile levels
+    N, M = Q_arr.shape
+    if M != len(alphas_arr):
+        raise ValueError(f"Quantile count mismatch: Q has {M} cols, alphas has {len(alphas_arr)}")
+    if np.any(np.diff(alphas_arr) <= 0):
+        raise ValueError("alphas must be strictly increasing")
+    if len(y_arr) != N:
+        raise ValueError(f"Length mismatch: y_true has {len(y_arr)} elements, quantiles has {N} rows")
+
+    # Enforce non-crossing sorting per row
+    for i in range(N):
+        if np.any(np.diff(Q_arr[i]) < 0):
+            Q_arr[i] = np.sort(Q_arr[i])
+
+    # Trapezoidal weights for non-uniform quantile grid
     weights = np.zeros(M)
     weights[0] = 0.5 * (alphas_arr[1] - alphas_arr[0])
     weights[-1] = 0.5 * (alphas_arr[-1] - alphas_arr[-2])
     for j in range(1, M - 1):
         weights[j] = 0.5 * (alphas_arr[j+1] - alphas_arr[j-1])
 
+    total_crps = 0.0
     for i in range(N):
         y_i = y_arr[i]
         sample_loss = 0.0
@@ -683,3 +1194,6 @@ def crps_score(y_true: Sequence[float], Q: np.ndarray, alphas: Sequence[float]) 
         total_crps += 2.0 * sample_loss
 
     return float(total_crps / N)
+
+# Canonical alias
+crps_score = crps_from_quantiles

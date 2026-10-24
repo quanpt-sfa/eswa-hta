@@ -19,6 +19,7 @@ if str(staging_dir) not in sys.path:
 from stage_data import (
     stage_holdout_data,
     audit_test_features_sanitization,
+    verify_agent_access_denial,
     FORBIDDEN_OUTCOME_COLUMNS
 )
 
@@ -115,6 +116,11 @@ def test_holdout_staging_execution(synthetic_master_dataset):
     assert dev_hash in manifest_text
     assert test_hash in manifest_text
 
+    # 6. Check receipt structure
+    receipt_text = receipt.read_text(encoding="utf-8")
+    assert "STAGING_OUTPUTS_CREATED__ACCESS_ISOLATION_UNVERIFIED" in receipt_text
+    assert "Positive-Selection Feature Allowlist" in receipt_text
+
 
 def test_sanitization_audit_catches_leakage():
     leaky_df = pd.DataFrame({
@@ -162,8 +168,122 @@ def test_staging_rejects_source_specific_audited_columns(synthetic_master_datase
             receipt_path=folder / "receipt.md",
             manifest_path=folder / "manifest.sha256",
             approved_test_feature_columns=[
-                "firm_id", "fiscal_year", "scope", "pat_pre",
+                "firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre",
                 "fs_aud_profit_after_tax",
             ],
         )
     assert not (folder / "out" / "test.parquet").exists()
+
+
+def test_staging_rejects_allowlist_with_pat_post_or_audit_adj(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    with pytest.raises(ValueError, match="Forbidden"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=[
+                "firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre",
+                "pat_post",
+            ],
+        )
+
+
+def test_staging_rejects_missing_required_identifiers_in_allowlist(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    with pytest.raises(ValueError, match="required keys"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=[
+                "firm_id", "fiscal_year", "feature_sales_growth"  # Missing 'scope'
+            ],
+        )
+
+
+def test_staging_rejects_duplicate_primary_keys(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    df = pd.read_parquet(master)
+    # Duplicate first row
+    dup_df = pd.concat([df, df.iloc[[0]]], ignore_index=True)
+    dup_file = folder / "dup_master.parquet"
+    dup_df.to_parquet(dup_file, index=False)
+
+    with pytest.raises(ValueError, match="Duplicate primary key"):
+        stage_holdout_data(
+            master_path=dup_file,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=[
+                "firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"
+            ],
+        )
+
+
+def test_staging_rejects_unexpected_fiscal_years(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    df = pd.read_parquet(master)
+    df.loc[0, "fiscal_year"] = 2010  # Pre-2015 out of bounds
+    out_of_bounds_file = folder / "out_of_bounds.parquet"
+    df.to_parquet(out_of_bounds_file, index=False)
+
+    with pytest.raises(ValueError, match="Unexpected fiscal year range"):
+        stage_holdout_data(
+            master_path=out_of_bounds_file,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=[
+                "firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"
+            ],
+        )
+
+
+def test_staging_rejects_overlapping_output_paths(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    shared_path = folder / "out" / "same_file.parquet"
+    with pytest.raises(ValueError, match="must all be distinct"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=shared_path,
+            output_sealed_outcomes_path=shared_path,  # OVERLAP
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=[
+                "firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"
+            ],
+        )
+
+
+def test_staging_rejects_missing_required_target_inputs(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    df = pd.read_parquet(master)
+    df_missing = df.drop(columns=["pat_post"])
+    missing_file = folder / "missing_target.parquet"
+    df_missing.to_parquet(missing_file, index=False)
+
+    with pytest.raises(KeyError, match="Required target input 'pat_post' missing"):
+        stage_holdout_data(
+            master_path=missing_file,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=[
+                "firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"
+            ],
+        )
