@@ -72,7 +72,11 @@ def test_holdout_staging_execution(synthetic_master_dataset):
         receipt_path=receipt,
         manifest_path=manifest,
         dev_max_year=2022,
-        test_min_year=2023
+        test_min_year=2023,
+        approved_test_feature_columns=[
+            "firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre",
+            "feature_sales_growth", "feature_leverage",
+        ],
     )
 
     # 1. Assert file creations
@@ -124,3 +128,42 @@ def test_sanitization_audit_catches_leakage():
     violations = audit_test_features_sanitization(leaky_df)
     assert "pat_post" in violations
     assert "y_k050" in violations
+
+
+def test_staging_rejects_missing_human_allowlist(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    with pytest.raises(ValueError, match="allowlist"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+        )
+    assert not (folder / "out" / "test.parquet").exists()
+
+
+def test_staging_rejects_source_specific_audited_columns(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    df = pd.read_parquet(master)
+    df["fs_aud_profit_after_tax"] = df["pat_post"]
+    df["audit_adj_revenue"] = 123.0
+    df.to_parquet(master, index=False)
+    assert set(audit_test_features_sanitization(df)) >= {
+        "fs_aud_profit_after_tax", "audit_adj_revenue"
+    }
+    with pytest.raises(ValueError, match="Forbidden"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=[
+                "firm_id", "fiscal_year", "scope", "pat_pre",
+                "fs_aud_profit_after_tax",
+            ],
+        )
+    assert not (folder / "out" / "test.parquet").exists()
