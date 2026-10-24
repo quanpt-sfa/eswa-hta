@@ -1,4 +1,24 @@
-# Python
+# ==============================================================================
+# .gitignore — ESWA-HTA Repository Security and Research Data Protection
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Local Secrets, Credentials & Environment Configurations
+# ------------------------------------------------------------------------------
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.cert
+*.p12
+secrets/
+credentials/
+token*.txt
+
+# ------------------------------------------------------------------------------
+# 2. Python Runtime, Build, & Virtual Environments
+# ------------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -21,13 +41,15 @@ share/python-wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# Virtual environments (local only)
 .venv/
 venv/
 ENV/
 env/
 
-# Testing & Coverage
+# ------------------------------------------------------------------------------
+# 3. Testing, Coverage, Profiling, & Jupyter
+# ------------------------------------------------------------------------------
 .pytest_cache/
 .coverage
 .coverage.*
@@ -36,11 +58,11 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+.ipynb_checkpoints/
 
-# Jupyter Notebooks
-.ipynb_checkpoints
-
-# IDEs and OS
+# ------------------------------------------------------------------------------
+# 4. IDEs, OS, & Temporary System Files
+# ------------------------------------------------------------------------------
 .vscode/
 .idea/
 *.swp
@@ -49,3 +71,94 @@ coverage.xml
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ------------------------------------------------------------------------------
+# 5. Research Data Protection (Strict Public Repo Exclusions)
+# ------------------------------------------------------------------------------
+# Protect all data directories
+data/source/*
+!data/source/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/locked/*
+!data/locked/.gitkeep
+
+# Exclude sensitive tabular and database binary formats anywhere in repo
+*.parquet
+*.feather
+*.arrow
+*.h5
+*.hdf5
+*.dta
+*.sas7bdat
+*.sav
+*.sqlite
+*.sqlite3
+*.db
+
+# Archives containing bulk data
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# ------------------------------------------------------------------------------
+# 6. Model Weights, Checkpoints, & Serialized Objects
+# ------------------------------------------------------------------------------
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.cbm
+checkpoints/
+weights/
+
+# ------------------------------------------------------------------------------
+# 7. Experiment Outputs, Predictions, & Logs
+# ------------------------------------------------------------------------------
+# Protect outputs directory (predictions, evaluation tables, plots)
+outputs/*
+!outputs/.gitkeep
+outputs/**/*
+!outputs/**/.gitkeep
+
+# Protect runtime and error logs
+logs/*
+!logs/.gitkeep
+logs/**/*
+!logs/**/.gitkeep
+*.log
+!DECISIONS.log
+
+# ------------------------------------------------------------------------------
+# 8. Whitelist / Preserved Project Assets
+# ------------------------------------------------------------------------------
+# Ensure harmless structure anchors are tracked
+!**/data/**/.gitkeep
+!**/outputs/**/.gitkeep
+!**/logs/**/.gitkeep
+
+# Ensure approved synthetic fixtures, source code, configs, and docs remain tracked
+!fixtures/*.csv
+!fixtures/*.sha256
+!fixtures/.gitkeep
+!config/*.yaml
+!config/*.yml
+!config/.gitkeep
+!contracts/*.md
+!contracts/*.yaml
+!contracts/*.sha256
+!contracts/.gitkeep
+!src/**/*.py
+!tests/**/*.py
+!reference/*.py
+!docs/**/*.md
+!gates/**/*.md
