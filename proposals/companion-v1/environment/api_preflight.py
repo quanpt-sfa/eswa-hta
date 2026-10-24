@@ -32,7 +32,10 @@ def compute_file_sha256(filepath: Path) -> str:
     return h.hexdigest()
 
 
-def probe_api_compatibility(checkpoint_path: Path = None) -> Dict[str, Any]:
+def probe_api_compatibility(
+    checkpoint_path: Path = None,
+    expected_checkpoint_sha256: str = None
+) -> Dict[str, Any]:
     """Runs automated preflight probe across all modeling engines."""
     report: Dict[str, Any] = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -55,13 +58,22 @@ def probe_api_compatibility(checkpoint_path: Path = None) -> Dict[str, Any]:
 
         # Inspect alphas
         alphas = getattr(r, "alphas_", None)
+        shape_ok = tuple(Q.shape) == (5, 999)
+        alpha_ok = (
+            alphas is not None
+            and len(alphas) == Q.shape[1]
+            and bool(np.isfinite(alphas).all())
+            and bool(np.all(np.diff(alphas) > 0))
+            and bool(np.all((np.asarray(alphas) > 0) & (np.asarray(alphas) < 1)))
+        )
+        quantile_ok = bool(np.isfinite(Q).all() and np.all(np.diff(Q, axis=1) >= 0))
         report["components"]["TabICLRegressor"] = {
-            "status": "PASSED",
+            "status": "PASSED" if shape_ok and alpha_ok and quantile_ok else "FAILED_GEOMETRY_OR_ALPHA_GRID",
             "output_shape": list(Q.shape),
             "expected_shape": [5, 999],
             "alphas_exposed": alphas is not None,
-            "alphas_count": len(alphas) if alphas is not None else Q.shape[1],
-            "monotonic_quantiles": bool(np.all(np.diff(Q, axis=1) >= 0))
+            "alphas_count": len(alphas) if alphas is not None else None,
+            "monotonic_quantiles": quantile_ok
         }
     except ImportError as e:
         report["components"]["TabICLRegressor"] = {"status": "BLOCKED_IMPORT_ERROR", "error": str(e)}
@@ -76,8 +88,15 @@ def probe_api_compatibility(checkpoint_path: Path = None) -> Dict[str, Any]:
         probs = clf.predict_proba(X_toy[:5])
         classes = getattr(clf, "classes_", None)
 
+        classes_ok = classes is not None and set(int(x) for x in classes) == {0, 1}
+        prob_ok = (
+            probs.shape == (5, 2)
+            and bool(np.isfinite(probs).all())
+            and bool(np.all((probs >= 0) & (probs <= 1)))
+            and bool(np.allclose(np.sum(probs, axis=1), 1.0))
+        )
         report["components"]["TabICLClassifier"] = {
-            "status": "PASSED",
+            "status": "PASSED" if classes_ok and prob_ok else "FAILED_PROBABILITY_OR_CLASSES",
             "classes_": list(classes) if classes is not None else None,
             "probs_shape": list(probs.shape),
             "sums_to_one": bool(np.allclose(np.sum(probs, axis=1), 1.0))
@@ -95,8 +114,9 @@ def probe_api_compatibility(checkpoint_path: Path = None) -> Dict[str, Any]:
         cb.fit(X_toy, y_toy)
         cb_preds = cb.predict(X_toy[:5])
 
+        cb_geometry_ok = cb_preds.shape == (5, 99) and bool(np.isfinite(cb_preds).all())
         report["components"]["CatBoostMultiQuantile"] = {
-            "status": "PASSED",
+            "status": "PASSED" if cb_geometry_ok else "FAILED_OUTPUT_GEOMETRY",
             "output_shape": list(cb_preds.shape),
             "expected_shape": [5, 99],
             "monotonic_quantiles": bool(np.all(np.diff(cb_preds, axis=1) >= 0))
@@ -128,7 +148,10 @@ def probe_api_compatibility(checkpoint_path: Path = None) -> Dict[str, Any]:
             ng_results["TFixedDf"] = {"available": False}
 
         report["components"]["NGBoost"] = {
-            "status": "PASSED",
+            "status": "PASSED" if ng_results.get("TFixedDf", {}).get("available", False)
+                and all(ng_results[k]["has_cdf"] and ng_results[k]["has_sf"]
+                        for k in ("Normal", "Laplace"))
+                else "FAILED_REGISTERED_DISTRIBUTION_SUPPORT",
             "distributions": ng_results
         }
     except ImportError as e:
@@ -137,22 +160,24 @@ def probe_api_compatibility(checkpoint_path: Path = None) -> Dict[str, Any]:
         report["components"]["NGBoost"] = {"status": "FAILED", "error": str(e)}
 
     # 5. Checkpoint Verification
-    if checkpoint_path and checkpoint_path.exists():
+    if checkpoint_path is not None and checkpoint_path.exists() and expected_checkpoint_sha256:
+        observed_sha = compute_file_sha256(checkpoint_path)
         report["components"]["Checkpoint"] = {
             "path": str(checkpoint_path),
-            "sha256": compute_file_sha256(checkpoint_path),
-            "status": "VERIFIED"
+            "sha256": observed_sha,
+            "status": "PASSED" if observed_sha.lower() == expected_checkpoint_sha256.lower()
+                else "FAILED_CHECKPOINT_HASH"
         }
     else:
         report["components"]["Checkpoint"] = {
-            "status": "PENDING_HUMAN_CHECKPOINT_PROVISION"
+            "status": "BLOCKED_APPROVED_CHECKPOINT_OR_HASH_MISSING"
         }
 
     # Evaluate Overall Status
     statuses = [v.get("status") for v in report["components"].values()]
     if all(s == "PASSED" for s in statuses):
         report["status"] = "ALL_PROBES_PASSED"
-    elif any("BLOCKED" in s for s in statuses):
+    elif any(isinstance(s, str) and "BLOCKED" in s for s in statuses):
         report["status"] = "BLOCKED_DEPENDENCIES_UNINSTALLED"
     else:
         report["status"] = "PROBES_FAILED"
