@@ -1,0 +1,92 @@
+# HTA-TabICL Research Protocol (Candidate Proposal v1.0)
+# Governance: docs/HTA_IMPLEMENTATION_SPEC_v1.2.md (§0.1, §2 D01-D25, §15.1)
+# Status: CANDIDATE_PROPOSAL_PENDING_HUMAN_APPROVAL
+# Notice: Under Rule A2, do not alter these parameters without protocol version amendment.
+
+project:
+  name: "HTA-TabICL"
+  specification_version: "1.2"
+  protocol_version: "1.0-candidate"
+  title: "Threshold-aware hurdle distributional learning for misstatement-risk screening from pre-audit financial statements (Vietnam, 2015-2025)"
+  confirmed_by_human: false
+
+random_seeds:
+  model_seed: 42
+  tabicl_variance_seeds: [42, 43, 44]
+  bootstrap_seed: 42
+  bootstrap_replications: 1000
+  confidence_level: 0.95
+
+temporal_windows:
+  development_years: [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022]
+  final_test_years: [2023, 2024, 2025]
+  expanding_folds:
+    F1: { train: [2015, 2016, 2017, 2018], val: [2019] }
+    F2: { train: [2015, 2016, 2017, 2018, 2019], val: [2020] }
+    F3: { train: [2015, 2016, 2017, 2018, 2019, 2020], val: [2021] }
+    F4: { train: [2015, 2016, 2017, 2018, 2019, 2020, 2021], val: [2022] }
+
+outcome_specification:
+  primary_threshold_k: 0.05
+  threshold_grid: [0.05, 0.075, 0.10, 0.15, 0.20]
+  zero_adjustment_tolerance: 0.0   # D07: Frozen before G1; exact zero convention
+  target_scale: "D = delta / total_assets_pre"
+  normalized_threshold: "c_k = k * |pat_pre| / total_assets_pre"
+  target_transform:
+    primary: "identity"
+    sensitivity: "asinh(D / s)"    # D18: Pre-registered sensitivity only
+
+feature_sets:
+  X1: "core pre-audit accounting ratios and size predictors"
+  X2: "X1 + {q, c_k050, near_zero_bin_id}"  # D12: q = |pat_pre| / assets
+  near_zero_bins:
+    method: "quintiles_on_development_eligible_model"
+    n_bins: 5
+
+models:
+  primary_claim:
+    proposed_model: "M1"         # TabICL hurdle model (classifier on is_zero_adj + TabICL regressor)
+    primary_benchmark: "B3a"     # CatBoost MultiQuantile with X2
+    primary_metric: "Average Precision at k=0.05"
+    evaluation_test: "paired_firm_cluster_bootstrap"
+  registered_suite:
+    B1: { family: "CatBoost", objective: "PointRegression", features: "X1" }
+    B2: { family: "TabICL", objective: "DirectQuantileRegression", features: "X2" }
+    B3a: { family: "CatBoost", objective: "MultiQuantile", features: "X2", grid_levels: 99 }
+    B3b: { family: "CatBoost", objective: "PointRegression", features: "X2" }
+    B4: { family: "NGBoost", objective: "ParametricDistribution", distributions: ["Normal", "Laplace", "TFixedDf"] }
+    B5: { family: "CatBoost", objective: "BinaryClassification", target: "y_k050", features: "X2" }
+    B6: { family: "TabICL", objective: "BinaryClassification", target: "y_k050", features: "X2" }
+    B7: { family: "CatBoostHurdle", zero_part: "CatBoostClassifier", nonzero_part: "CatBoostMQ" }
+    B8: { family: "CatBoostHurdleEnsemble", zero_part: "CatBoostClassifier", nonzero_part: "CatBoostMQ" }
+    M0: { family: "TabICL", objective: "QuantileRegression", features: "X2" }
+    M1: { family: "TabICL", objective: "HurdleMixture", zero_part: "TabICLClassifier", nonzero_part: "TabICLRegressor", features: "X2" }
+
+quantile_grids:
+  catboost_multiquantile:
+    alpha_min: 0.01
+    alpha_max: 0.99
+    step: 0.01
+    count: 99
+  tabicl:
+    provisional_count: 999
+    output_type: "raw_quantiles"
+    verification_required_at_G0: true
+
+tail_policies:
+  primary: "conservative"        # D15: P(D >= c) = 0 if c > Q_max; P(D <= -c) = 0 if -c < Q_min
+  sensitivity: "optimistic"      # D15: Linear tail extrapolation
+
+screening_budgets:
+  budget_fractions: [0.05, 0.10] # D21: top 5% and top 10% ranked firms within fiscal year
+
+pilot_gate_G6:
+  status: "UNRESOLVED_PENDING_HUMAN_CONFIRMATION"
+  noninferiority_margin: null    # H4: Must be reviewed and set by human research lead
+  minimum_support_count: null    # H4: Must be confirmed by human lead
+  confirmed_by_human: false
+
+reconciliation_targets:
+  status: "UNRESOLVED_PENDING_HUMAN_STAGING"
+  source_dataset_version: null   # Provided in staged_holdout_receipt.md
+  expected_counts_by_year: {}    # To be populated exclusively from human-staged development file

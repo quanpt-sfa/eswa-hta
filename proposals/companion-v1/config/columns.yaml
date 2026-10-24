@@ -1,0 +1,108 @@
+# Physical Column Mapping Contract (Candidate Proposal v1.0)
+# Governance: docs/HTA_IMPLEMENTATION_SPEC_v1.2.md (§0.1 Rule A2, §1 H1-H3, §4.1, §15.1)
+# Status: CANDIDATE_PROPOSAL_UNAPPROVED (Requires Human Sign-off H1-H3)
+
+schema_version: "1.2"
+status: "CANDIDATE_PROPOSAL_UNAPPROVED"
+approved_by_human: false
+approval_date: null
+human_approver: null
+
+# 1. Primary Keys & Stratification Keys (§4.1)
+keys:
+  firm_id:
+    semantic_name: "firm_id"
+    description: "Unique persistent firm identifier across fiscal years"
+    candidate_physical_columns: ["firm_id", "ticker", "tax_code", "company_id"]
+    physical_column_selected: null   # Set during G1a
+    dtype: "string"
+    required: true
+
+  fiscal_year:
+    semantic_name: "fiscal_year"
+    description: "Reporting fiscal accounting year"
+    candidate_physical_columns: ["fiscal_year", "year", "nam_tai_chinh"]
+    physical_column_selected: null
+    dtype: "int16"
+    required: true
+
+  scope:
+    semantic_name: "scope"
+    description: "Financial statement reporting scope: 'consolidated' or 'separate'"
+    candidate_physical_columns: ["scope", "report_type", "loai_bao_cao"]
+    physical_column_selected: null
+    dtype: "string"
+    required: true
+    selection_rule: "consolidated preferred; separate only when consolidated unavailable (H1)"
+
+  ticker:
+    semantic_name: "ticker"
+    candidate_physical_columns: ["ticker", "stock_code", "ma_ck"]
+    dtype: "string"
+    required: false
+
+  exchange:
+    semantic_name: "exchange"
+    candidate_physical_columns: ["exchange", "san_gd"]
+    dtype: "string"
+    required: false
+
+  industry:
+    semantic_name: "industry"
+    candidate_physical_columns: ["industry", "icb_code", "nganh"]
+    dtype: "string"
+    required: false
+
+# 2. Financial Target Inputs (§4.1, §5 G1b)
+outcome_inputs:
+  pat_pre:
+    semantic_name: "pat_pre"
+    description: "Pre-audit profit after tax reported in unaudited FYt statements"
+    candidate_physical_columns: ["pat_pre", "lnst_truoc_kiem_toan", "profit_after_tax_pre"]
+    physical_column_selected: null
+    dtype: "float64"
+    when: "t_pre"
+    required: true
+
+  pat_post:
+    semantic_name: "pat_post"
+    description: "Audited post-audit profit after tax reported in audited FYt statements"
+    candidate_physical_columns: ["pat_post", "lnst_sau_kiem_toan", "profit_after_tax_post"]
+    physical_column_selected: null
+    dtype: "float64"
+    when: "t_post"
+    required: true
+    access_boundary: "Development years (2015-2022) only. Sealed until G10 for test years (2023-2025)."
+
+  total_assets_pre:
+    semantic_name: "total_assets_pre"
+    description: "Total assets reported in unaudited pre-audit balance sheet"
+    candidate_physical_columns: ["total_assets_pre", "tong_tai_san_pre", "assets_pre"]
+    physical_column_selected: null
+    dtype: "float64"
+    when: "t_pre"
+    required: true
+
+# 3. Currency and Monetary Scale (§1 H2)
+currency_and_unit:
+  currency: "VND"
+  unit_multiplier: null          # H2: Must be confirmed by human lead (e.g., 1.0, 1000.0, or 1000000.0)
+  target_standard_unit: "VND"
+
+# 4. Point-in-Time Availability & Leakage Controls (§2 D08-D09, §4.2)
+point_in_time_metadata:
+  prediction_cutoff:
+    semantic_name: "prediction_cutoff"
+    description: "Timestamp marking publication of unaudited FYt statements"
+    candidate_physical_columns: ["unaudited_pub_date", "ngay_cong_bo_bctc_chua_kt"]
+    physical_column_selected: null
+    dtype: "datetime64[ns]"
+
+  audit_publication_date:
+    semantic_name: "audit_pub_date"
+    description: "Timestamp marking publication of audited FYt statements"
+    candidate_physical_columns: ["audited_pub_date", "ngay_cong_bo_bctc_kt"]
+    physical_column_selected: null
+    dtype: "datetime64[ns]"
+
+  availability_policy: "strict_source_backed" # Unknown date -> feature unavailable in strict primary

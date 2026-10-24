@@ -41,3 +41,43 @@ Status categorization of G0 preflight checks:
   - Fixture and input SHA-256 verification (manifests missing)
 
 Human approval: PENDING (agent cannot self-approve; G0 remains STOP_BLOCKER)
+
+---
+
+## Remediation Audit Trail — Commit 742dbb5 & Candidate Companion Bundle
+
+**Audit Date:** 2026-10-24  
+**Starting Commit:** `742dbb580db1dfabec990a7fe676352937441e94`  
+**Overall Gate Status:** `STOP_BLOCKER` (Unresolved human dependencies; holdout isolation unverified)
+
+### 1. Modified and Created Artifacts
+- **Governance & Security Contracts Modified/Created:**
+  - `gates/G0_QA_report.md`: Retracted unsupported holdout isolation PASS; added structured classification.
+  - `.gitignore`: Hardened against raw/processed data, binary tables (`*.parquet`), checkpoints (`*.pt`, `*.ckpt`), logs, and secrets.
+  - `contracts/REPOSITORY_DATA_PROTECTION_AUDIT.md`: Confirmed zero sensitive files in Git history; verified 17 path exclusion rules.
+  - `contracts/COMPANION_BUNDLE_HANDOFF.md`: Corrected T-Z02 ($y=0$); added T-Z03 ($y=1$); documented reference function mathematical contracts.
+  - `contracts/HUMAN_HOLDOUT_STAGING_RUNBOOK.md` & `contracts/staged_holdout_receipt.template.md`: Defined vault/container/ACL isolation architectures for human steward.
+  - `contracts/ENVIRONMENT_PREFLIGHT.md`: Retracted unverified RTX 3060 TabICLv2 feasibility guarantees; documented API preflight test matrix.
+  - `OPEN_QUESTIONS.md` & `DECISIONS.log`: Restructured blocker register and logged all remediation actions.
+- **Candidate Companion Bundle Artifacts (`proposals/companion-v1/`):**
+  - Fixtures: `fixtures/golden_cases.csv`, `fixtures/golden_expectations.csv`, `GOLDEN_CASE_DERIVATIONS.md`, `fixture_validation_report.md`
+  - Reference: `reference/hta_ref.py`, `reference/test_hta_ref.py`, `reference/API_CONTRACT.md`, `reference/REFERENCE_QA_REPORT.md`
+  - Configurations: `config/protocol.yaml`, `config/columns.yaml`, `contracts/gate_acceptance_manifest.yaml`, `CONFIG_VALIDATION_REPORT.md`
+
+### 2. Corrected Mathematical Contracts
+- **Case T-Z02 (Subthreshold Adjustment):** Corrected expected label from $y=1$ to $y=0$ ($|\Delta|=10^{-10} < 0.05 \times 100 = 5.0$).
+- **Case T-Z03 (Genuine Near-Zero Exceedance):** Added test with $PAT_{pre}=10^{-9}, PAT_{post}=1.1 \times 10^{-9}, k=0.05$ where $|\Delta|=10^{-10} \ge 5 \times 10^{-11} \implies y=1$.
+- **Post-Denominator Asymmetry:** Algebraically derived and tested cut magnitude reversal between positive and negative earnings ($PAT_{pre} \gtrless 0$).
+
+### 3. Verification Test Evidence
+- `python -m pytest proposals/companion-v1/fixtures/test_fixture_schema.py -v`: **5 passed in 2.24s (Exit Code: 0)**
+- `python -m pytest proposals/companion-v1/reference/test_hta_ref.py -v`: **12 passed in 3.98s (Exit Code: 0)**
+- `python -c "import yaml; ..."`: **3 YAML configs parsed successfully without error (Exit Code: 0)**
+
+### 4. Human-Owned Blockers and Pending Approvals
+- **OQ-001:** Companion bundle promotion and independent human certification.
+- **OQ-002:** Holdout data physical isolation on local host and steward staging.
+- **OQ-003:** Pinned dependency versions and approved TabICLv2 checkpoint SHA-256.
+- **OQ-004:** Public GitHub repository visibility and push authorizations.
+
+**Final Disposition:** `STOP_BLOCKER` (Holdout isolation NOT VERIFIED; companion bundle remains PENDING_INDEPENDENT_REVIEW).

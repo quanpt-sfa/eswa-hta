@@ -21,7 +21,7 @@ Diagnostics were executed independently via Python and PowerShell probes on the 
 | **PyTorch Version** | `2.6.0+cu118` | Compatible with CUDA 11.8 |
 | **CUDA Available** | `True` | GPU Acceleration Active |
 | **GPU Hardware** | NVIDIA GeForce RTX 3060 | Compatible Ampere Architecture |
-| **VRAM Total** | 12.00 GB Dedicated GDDR6 | Sufficient for TabICLv2 inference ($< 6 \text{ GB}$ required) |
+| **VRAM Total** | 12.00 GB Dedicated GDDR6 | GPU detected; memory feasibility of the registered TabICLv2 configuration remains unverified until an executable inference and memory preflight passes. |
 | **CUDA Archs Supported** | `sm_37`, `sm_50`, `sm_60`, `sm_61`, `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_90` | `sm_86` matches RTX 3060 |
 | **Repository Disk Space** | Drive `D:\` — Free: 116.77 GB / Total: 1863.01 GB | Sufficient ($> 50 \text{ GB}$ required) |
 | **System Drive Disk Space** | Drive `C:\` — Free: 29.26 GB / Total: 475.16 GB | Sufficient |
@@ -108,7 +108,7 @@ Once pinned packages are installed in `.venv`, the agent will execute the automa
 
 ## 6. Current Disposition
 
-- **Hardware & CUDA Capability:** PASSED (RTX 3060, 12GB VRAM, CUDA 11.8).
+- **Hardware & CUDA Capability:** GPU detected (RTX 3060, 12GB VRAM, CUDA 11.8); memory feasibility of the registered TabICLv2 configuration remains unverified until an executable inference and memory preflight passes.
 - **Project Isolation:** PASSED (`.venv` initialized).
 - **Library Installation:** BLOCKED pending human-approved pinned manifest (`protocol.yaml`).
 - **Checkpoint Validation:** BLOCKED pending human-approved checkpoint SHA-256.

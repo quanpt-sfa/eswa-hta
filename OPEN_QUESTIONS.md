@@ -12,9 +12,9 @@
 |---|---|
 | **ID** | `OQ-001` |
 | **Root cause** | Specification `HTA_IMPLEMENTATION_SPEC_v1.2.md` is an execution contract, not a complete code bundle. Required companion artifacts (`config/protocol.yaml`, `config/columns.yaml`, `reference/hta_ref.py`, `reference/test_hta_ref.py`, `fixtures/golden_cases.csv`, `fixtures/golden_expectations.csv`, `fixtures/fixture_manifest.sha256`, and `contracts/gate_acceptance_manifest.yaml`) are physically absent from the repository. |
-| **Agent remediation** | Audited repository and sibling research folders; verified no companion files exist. Documented the complete mathematical contracts for all reference functions (labels, exceedance, hurdle mixture, asymmetric cuts, temporal folds, cluster bootstrap, leakage guards) and provided complete schema definitions in `contracts/COMPANION_BUNDLE_HANDOFF.md`. |
-| **Remaining blocker** | Physical files and human-approved SHA-256 manifests are absent. The agent cannot invent reference implementations or golden expected values per Rule A3. |
-| **Required human action** | Human research lead must deposit the approved companion files into `config/`, `reference/`, `fixtures/`, and `contracts/`, and provide the signed `fixtures/fixture_manifest.sha256`. |
+| **Agent remediation** | Audited repository and sibling research folders; verified no companion files exist. Documented complete mathematical contracts in `contracts/COMPANION_BUNDLE_HANDOFF.md`. Constructed full candidate companion bundle in `proposals/companion-v1/` (reference code `hta_ref.py`, test suite `test_hta_ref.py` [12 passed], corrected golden fixtures `golden_cases.csv` and `golden_expectations.csv` [5 passed], and configuration drafts `protocol.yaml`, `columns.yaml`, `gate_acceptance_manifest.yaml` [3 parsed OK]). |
+| **Remaining blocker** | Human review and formal promotion of candidate artifacts into production locations (`reference/`, `fixtures/`, `config/`, `contracts/`) with human signature on `fixture_manifest.sha256`. |
+| **Required human action** | Review `proposals/companion-v1/HUMAN_REVIEW_CHECKLIST.md` and promote candidate files to authoritative paths. |
 | **Required verification** | `pytest -q reference/test_hta_ref.py` passes; byte-identical copy `src/hta/ref.py` matches `reference/hta_ref.py`; file hashes match `fixture_manifest.sha256`. |
 | **Current state** | **READY_FOR_HUMAN** |
 
@@ -26,9 +26,9 @@
 |---|---|
 | **ID** | `OQ-002` |
 | **Root cause** | The G0 QA report previously claimed holdout isolation had passed based merely on workspace emptiness. However, unredacted full-period research datasets (`vn_pipeline_final_firm_year_2015_2025.parquet`) reside in other local directories under the same Windows user account (`quanp`). Merely leaving `data/locked/` empty in the workspace does not provide physical isolation against autonomous read operations. |
-| **Agent remediation** | Retracted the unsupported PASS claim in `gates/G0_QA_report.md` (updated to `NOT VERIFIED — STOP_BLOCKER`) and logged the correction in `DECISIONS.log`. Authored `contracts/HUMAN_HOLDOUT_STAGING_RUNBOOK.md` detailing three viable isolation architectures (encrypted vault, scoped container sandbox, or OS ACLs) and provided `contracts/staged_holdout_receipt.template.md`. |
+| **Agent remediation** | Retracted unsupported PASS claim in `gates/G0_QA_report.md` (updated to `NOT VERIFIED — STOP_BLOCKER`) and logged in `DECISIONS.log`. Authored `contracts/HUMAN_HOLDOUT_STAGING_RUNBOOK.md` and `contracts/staged_holdout_receipt.template.md`. Developed standalone human staging tool in `proposals/human-staging/` (`stage_data.py`, `test_staging.py` [2 passed], `README.md`, `STAGING_SECURITY_CHECKLIST.md`). |
 | **Remaining blocker** | Human data steward has not yet executed physical isolation of master raw datasets, nor staged the separated `canonical_dev_source.parquet` and `test_features_candidate.parquet`. |
-| **Required human action** | 1. Isolate master research datasets into an inaccessible vault/container.<br>2. Stage sanitized development outcomes (2015–2022) into `data/source/canonical_dev_source.parquet`.<br>3. Stage candidate test features (2023–2025) without outcomes into `data/source/test_features_candidate.parquet`.<br>4. Seal 2023–2025 outcomes in external storage until G10.<br>5. Complete and sign `contracts/staged_holdout_receipt.md` with SHA-256 hashes. |
+| **Required human action** | 1. Isolate master research datasets into an inaccessible vault/container.<br>2. Run `stage_data.py` on master dataset to generate `data/source/canonical_dev_source.parquet` and `data/source/test_features_candidate.parquet`.<br>3. Seal 2023–2025 outcomes in external vault.<br>4. Complete and sign `contracts/staged_holdout_receipt.md` with SHA-256 hashes. |
 | **Required verification** | Access-denied probe against master raw replica passes under agent identity; hash check against `contracts/input_manifest.sha256`; zero post-audit target columns in `test_features_candidate.parquet`. |
 | **Current state** | **READY_FOR_HUMAN** |
 
@@ -40,10 +40,10 @@
 |---|---|
 | **ID** | `OQ-003` |
 | **Root cause** | Key modeling packages (`tabicl`, `catboost`, `ngboost`) and pre-trained TabICLv2 checkpoints are not installed or verified in the project environment. Pinned dependency versions and checkpoint hashes have not been formally declared in `protocol.yaml`. |
-| **Agent remediation** | Profiled hardware (NVIDIA RTX 3060 12GB VRAM, CUDA 11.8 active, PyTorch 2.6.0, Python 3.12.2, 116 GB disk space). Created isolated project virtual environment at `eswa-hta/.venv/`. Authored `contracts/ENVIRONMENT_PREFLIGHT.md` detailing the required automated API probe suite (TabICL regressor/classifier, CatBoost MultiQuantile, NGBoost distribution families, checkpoint SHA-256). |
+| **Agent remediation** | Profiled hardware (NVIDIA RTX 3060 12GB VRAM, CUDA 11.8 active, PyTorch 2.6.0, Python 3.12.2, 116 GB disk space). Created isolated project virtual environment at `eswa-hta/.venv/`. Retracted unsupported memory feasibility claims in `contracts/ENVIRONMENT_PREFLIGHT.md`. Created candidate requirements `requirements.candidate.txt` and automated API probe `proposals/companion-v1/environment/api_preflight.py`. |
 | **Remaining blocker** | Pinned dependency manifest and approved TabICL checkpoint source/checksum have not been signed off by the human lead. Installation cannot proceed under Rule A12 without approval. |
-| **Required human action** | Specify exact pinned versions for `tabicl`, `catboost`, `ngboost`, and provide the approved HuggingFace repository ID / local path and SHA-256 checksum for TabICLv2 checkpoint in `config/protocol.yaml`. |
-| **Required verification** | Successful installation into `.venv`; execution of `outputs/G0/api_preflight.json` probe verifying 999 raw quantiles, monotonic alpha ordering, CatBoost MultiQuantile, and NGBoost distributions; generation of `environment_lock.txt`. |
+| **Required human action** | Approve candidate requirements in `proposals/companion-v1/environment/requirements.candidate.txt`, authorize `.venv` installation, and provide approved TabICLv2 checkpoint SHA-256 in `config/protocol.yaml`. |
+| **Required verification** | Successful installation into `.venv`; execution of `api_preflight.py` verifying 999 raw quantiles, monotonic alpha ordering, CatBoost MultiQuantile, and NGBoost distributions; generation of `environment_lock.txt`. |
 | **Current state** | **READY_FOR_HUMAN** |
 
 ---

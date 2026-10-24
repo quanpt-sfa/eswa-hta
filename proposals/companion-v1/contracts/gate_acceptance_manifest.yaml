@@ -1,0 +1,291 @@
+# Gate Acceptance Manifest Contract (Candidate Proposal v1.0)
+# Governance: docs/HTA_IMPLEMENTATION_SPEC_v1.2.md (§16.1, Rules A1-A12)
+# Status: CANDIDATE_PROPOSAL_PENDING_HUMAN_SIGN_OFF
+
+manifest_version: "1.2"
+project: "HTA-TabICL"
+
+gates:
+  G0:
+    name: "Environment and Bundle Preflight"
+    requires_approvals: []
+    input_files:
+      - path: "config/protocol.yaml"
+        access_class: "read_only"
+      - path: "config/columns.yaml"
+        access_class: "read_only"
+      - path: "reference/hta_ref.py"
+        access_class: "read_only"
+      - path: "reference/test_hta_ref.py"
+        access_class: "read_only"
+      - path: "fixtures/golden_cases.csv"
+        access_class: "read_only"
+      - path: "fixtures/golden_expectations.csv"
+        access_class: "read_only"
+      - path: "fixtures/fixture_manifest.sha256"
+        access_class: "read_only"
+    expected_outputs:
+      - path: "src/hta/ref.py"
+        description: "Byte-identical copy of reference/hta_ref.py"
+      - path: "environment_lock.txt"
+        description: "Frozen pip versions, python build, GPU metadata, model checkpoint hashes"
+      - path: "outputs/G0/api_preflight.json"
+        description: "API probe geometry, raw quantiles shape, distribution checks"
+      - path: "gates/G0_QA_report.md"
+        description: "Preflight verification and QA summary"
+    primary_key: null
+    row_scope: "N/A"
+    qa_command: "pytest -q reference/ tests/test_g0.py"
+    expected_exit_code: 0
+    numeric_tolerances:
+      analytic_prob_tol: 1e-10
+      quantile_interp_tol: 5e-4
+    stop_conditions:
+      - "Missing companion files"
+      - "Golden fixture failure"
+      - "Byte-identity mismatch between src/hta/ref.py and reference/hta_ref.py"
+      - "Unverified TabICL quantile shape or unmonotonic alpha levels"
+      - "Unverified holdout isolation"
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G1:
+    name: "Canonical Data and Label Construction"
+    requires_approvals: ["gates/G0_APPROVED.txt"]
+    input_files:
+      - path: "data/source/canonical_dev_source.parquet"
+        access_class: "development_only_2015_2022"
+      - path: "config/columns.yaml"
+        access_class: "human_approved_mapping"
+    expected_outputs:
+      - path: "data/processed/canonical_dev.parquet"
+        primary_key: ["firm_id", "fiscal_year"]
+        row_scope: "Development years 2015-2022 only"
+      - path: "outputs/G1/sample_attrition.csv"
+      - path: "outputs/G1/label_reconciliation_by_year.csv"
+      - path: "outputs/G1/duplicates.csv"
+      - path: "gates/G1_QA_report.md"
+    primary_key: ["firm_id", "fiscal_year"]
+    row_scope: "2015 <= fiscal_year <= 2022; one scope per firm-year"
+    qa_command: "pytest -q tests/test_g1.py"
+    expected_exit_code: 0
+    numeric_tolerances:
+      delta_exact_tol: 0.0
+      nesting_monotonicity_tol: 0.0
+    stop_conditions:
+      - "Duplicate firm-year keys in canonical table"
+      - "delta != pat_post - pat_pre"
+      - "Violation of nesting y_k200 <= y_k150 <= y_k100 <= y_k075 <= y_k050"
+      - "Row with eligible_model True and total_assets_pre <= 0"
+      - "Any FY2023-2025 data present in canonical_dev.parquet"
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G2:
+    name: "Point-in-Time Core Features (X1)"
+    requires_approvals: ["gates/G1_APPROVED.txt"]
+    input_files:
+      - path: "data/processed/canonical_dev.parquet"
+      - path: "config/columns.yaml"
+    expected_outputs:
+      - path: "data/processed/features_X1.parquet"
+      - path: "outputs/G2/feature_availability_audit.csv"
+      - path: "gates/G2_QA_report.md"
+    primary_key: ["firm_id", "fiscal_year"]
+    row_scope: "Matches canonical_dev.parquet exactly"
+    qa_command: "pytest -q tests/test_g2.py"
+    expected_exit_code: 0
+    stop_conditions:
+      - "Feature publication date > prediction cutoff"
+      - "Lag feature constructed across discontinuous years without audit date"
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G3:
+    name: "Diagnostics, Descriptive Invariants, and Sample Audits"
+    requires_approvals: ["gates/G2_APPROVED.txt"]
+    input_files:
+      - path: "data/processed/canonical_dev.parquet"
+      - path: "data/processed/features_X1.parquet"
+    expected_outputs:
+      - path: "outputs/G3/table1_summary_stats.csv"
+      - path: "outputs/G3/zero_adjustment_diagnostics.csv"
+      - path: "gates/G3_QA_report.md"
+    primary_key: ["firm_id", "fiscal_year"]
+    row_scope: "Development years 2015-2022"
+    qa_command: "pytest -q tests/test_g3.py"
+    expected_exit_code: 0
+    stop_conditions:
+      - "Retrospective tuning of zero tolerance (prohibited by D07)"
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G4:
+    name: "Feature Set X2 and Expanding-Window Data Splits"
+    requires_approvals: ["gates/G3_APPROVED.txt"]
+    input_files:
+      - path: "data/processed/canonical_dev.parquet"
+      - path: "data/processed/features_X1.parquet"
+      - path: "config/protocol.yaml"
+    expected_outputs:
+      - path: "data/processed/features_X2.parquet"
+      - path: "data/processed/dev_splits.json"
+      - path: "gates/G4_QA_report.md"
+    primary_key: ["firm_id", "fiscal_year"]
+    row_scope: "Development years 2015-2022; Folds F1-F4 locked"
+    qa_command: "pytest -q tests/test_g4.py"
+    expected_exit_code: 0
+    stop_conditions:
+      - "Temporal leakage across train/validation splits"
+      - "near_zero_bins calculated on non-development data"
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G5:
+    name: "Model Training on Development Folds (Baselines B1-B5)"
+    requires_approvals: ["gates/G4_APPROVED.txt"]
+    input_files:
+      - path: "data/processed/features_X2.parquet"
+      - path: "data/processed/dev_splits.json"
+    expected_outputs:
+      - path: "outputs/G5/predictions_val_folds_baselines.parquet"
+      - path: "outputs/G5/validation_metrics_baselines.csv"
+      - path: "gates/G5_QA_report.md"
+    primary_key: ["firm_id", "fiscal_year", "model_id"]
+    row_scope: "Validation fold firm-years (2019-2022)"
+    qa_command: "pytest -q tests/test_g5.py"
+    expected_exit_code: 0
+    stop_conditions:
+      - "Training on validation years"
+      - "MultiQuantile shape mismatch"
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G6:
+    name: "Pilot Decision Gate: M0/M1 Feasibility and Non-Inferiority"
+    requires_approvals: ["gates/G5_APPROVED.txt"]
+    input_files:
+      - path: "outputs/G5/predictions_val_folds_baselines.parquet"
+      - path: "outputs/G6/predictions_val_folds_tabicl.parquet"
+      - path: "config/protocol.yaml"
+    expected_outputs:
+      - path: "outputs/G6/pilot_decision_report.md"
+      - path: "gates/G6_QA_report.md"
+    primary_key: null
+    row_scope: "Development folds pooled (2019-2022)"
+    qa_command: "pytest -q tests/test_g6.py"
+    expected_exit_code: 0
+    stop_conditions:
+      - "M1 performance falls in NO-GO zone without protocol amendment"
+      - "Evaluation on test set prior to G10"
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G7:
+    name: "Hurdle Model Training and Full Dev Evaluation (B7, B8, M1)"
+    requires_approvals: ["gates/G6_APPROVED.txt"]
+    input_files:
+      - path: "data/processed/features_X2.parquet"
+      - path: "data/processed/dev_splits.json"
+    expected_outputs:
+      - path: "outputs/G7/predictions_val_folds_hurdle.parquet"
+      - path: "outputs/G7/validation_metrics_hurdle.csv"
+      - path: "gates/G7_QA_report.md"
+    primary_key: ["firm_id", "fiscal_year", "model_id"]
+    row_scope: "Validation folds (2019-2022)"
+    qa_command: "pytest -q tests/test_g7.py"
+    expected_exit_code: 0
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G8:
+    name: "Probability Calibration (Optional Sensitivity)"
+    requires_approvals: ["gates/G7_APPROVED.txt"]
+    input_files:
+      - path: "outputs/G7/predictions_val_folds_hurdle.parquet"
+    expected_outputs:
+      - path: "outputs/G8/calibration_audit.md"
+      - path: "gates/G8_QA_report.md"
+    primary_key: null
+    row_scope: "Development folds only"
+    qa_command: "pytest -q tests/test_g8.py"
+    expected_exit_code: 0
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G9:
+    name: "Full Model Lock and Test Feature Ingestion"
+    requires_approvals: ["gates/G7_APPROVED.txt"]
+    input_files:
+      - path: "data/source/test_features_candidate.parquet"
+      - path: "data/processed/features_X2.parquet"
+    expected_outputs:
+      - path: "outputs/G9/frozen_models_lock.sha256"
+      - path: "outputs/G9/test_predictions_blinded.parquet"
+      - path: "gates/G9_QA_report.md"
+    primary_key: ["firm_id", "fiscal_year", "model_id"]
+    row_scope: "Candidate test years 2023-2025 (features only)"
+    qa_command: "pytest -q tests/test_g9.py"
+    expected_exit_code: 0
+    stop_conditions:
+      - "test_features_candidate contains post-audit outcome columns"
+      - "Model retrained after lock is generated"
+    unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
+    approval_owner: "Human Research Lead"
+
+  G10:
+    name: "Test Outcome Unlock and Primary Hypothesis Evaluation"
+    requires_approvals: ["gates/G9_APPROVED.txt", "data/locked/HUMAN_UNLOCK_G10.txt"]
+    input_files:
+      - path: "data/locked/test_outcomes.parquet"
+      - path: "outputs/G9/test_predictions_blinded.parquet"
+      - path: "outputs/G9/frozen_models_lock.sha256"
+    expected_outputs:
+      - path: "outputs/G10/primary_endpoint_table.csv"
+      - path: "outputs/G10/paired_bootstrap_results.json"
+      - path: "gates/G10_QA_report.md"
+    primary_key: ["firm_id", "fiscal_year"]
+    row_scope: "Final test years 2023-2025"
+    qa_command: "pytest -q tests/test_g10.py"
+    expected_exit_code: 0
+    stop_conditions:
+      - "HUMAN_UNLOCK_G10.txt absent"
+      - "Frozen model checksum mismatch"
+    unlock_policy: "TEST_OUTCOMES_AUTHORIZED"
+    approval_owner: "Human Research Lead"
+
+  G11:
+    name: "Robustness, S3 Enforcement Ledger Validation, and Subgroup Analyses"
+    requires_approvals: ["gates/G10_APPROVED.txt"]
+    input_files:
+      - path: "outputs/G10/primary_endpoint_table.csv"
+    expected_outputs:
+      - path: "outputs/G11/table_robustness.csv"
+      - path: "outputs/G11/enforcement_ledger_validation.csv"
+      - path: "gates/G11_QA_report.md"
+    primary_key: null
+    row_scope: "Full sample descriptive / out-of-fold and test matches"
+    qa_command: "pytest -q tests/test_g11.py"
+    expected_exit_code: 0
+    unlock_policy: "TEST_OUTCOMES_AUTHORIZED"
+    approval_owner: "Human Research Lead"
+
+  G12:
+    name: "Replication Package and Final Artifact Lock"
+    requires_approvals: ["gates/G11_APPROVED.txt"]
+    input_files:
+      - path: "outputs/"
+      - path: "src/"
+      - path: "config/"
+    expected_outputs:
+      - path: "outputs/G12/REPLICATION_CHECKSUMS.sha256"
+      - path: "outputs/G12/final_reconciliation_audit.md"
+      - path: "gates/G12_QA_report.md"
+    primary_key: null
+    row_scope: "Entire repository"
+    qa_command: "pytest -q tests/"
+    expected_exit_code: 0
+    stop_conditions:
+      - "Hash mismatch in final replication bundle"
+    unlock_policy: "ALL_DATA_AUTHORIZED"
+    approval_owner: "Human Research Lead"

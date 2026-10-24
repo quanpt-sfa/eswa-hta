@@ -1,0 +1,19 @@
+# Candidate Pinned Requirements for HTA-TabICL Pipeline
+# Governance: docs/HTA_IMPLEMENTATION_SPEC_v1.2.md (§0.1 Rule A12, §5 G0, §15.3)
+# Status: PENDING_HUMAN_PINNING_APPROVAL (Do not install without human sign-off)
+
+# Core Scientific Computing & Tabular I/O
+numpy>=1.26.4,<2.0.0
+pandas>=2.2.2,<3.0.0
+scipy>=1.13.1,<2.0.0
+pyarrow>=16.1.0
+pyyaml>=6.0.1
+
+# Machine Learning & Modeling Engines
+torch>=2.2.0
+tabicl==2.2.0                # Specification v1.2 candidate (§5 G0)
+catboost==1.2.5              # Pinned for MultiQuantile stability
+ngboost==0.5.1               # Pinned for Normal, Laplace, TFixedDf
+
+# Testing & Quality Assurance
+pytest>=8.2.0

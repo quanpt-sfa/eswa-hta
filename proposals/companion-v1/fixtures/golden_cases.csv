@@ -1,0 +1,21 @@
+test_id,description,pat_pre,pat_post,total_assets_pre,k,dist_family,dist_param1,dist_param2,c,pi_zero
+T-L01,Below threshold adjustment,100,104,1000,0.05,,,,,
+T-L02,Inclusive threshold adjustment (positive),100,105,1000,0.05,,,,,
+T-L03,Negative adjustment at threshold,100,95,1000,0.05,,,,,
+T-L04,Zero pre-audit PAT (ineligible),0,10,1000,0.05,,,,,
+T-L05,Sign change (ineligible),100,-100,1000,0.05,,,,,
+T-L06,Zero post-audit PAT (eligible),100,0,1000,0.05,,,,,
+T-L07,Negative pre-audit PAT with negative adjustment at threshold,-100,-105,1000,0.05,,,,,
+T-L08,Negative pre-audit PAT with positive adjustment at threshold,-100,-95,1000,0.05,,,,,
+T-L09,Negative pre-audit PAT below threshold,-100,-96,1000,0.05,,,,,
+T-Z01,Exact zero adjustment,100,100,1000,0.05,,,,,
+T-Z02,Small adjustment below materiality threshold (corrected),100,100.0000000001,1000,0.05,,,,,
+T-Z03,Near-zero earnings with genuine threshold exceedance,1e-9,1.1e-9,1000,0.05,,,,,
+T-M01,"Zero assets (eligible_label True, eligible_model False)",100,105,0,0.05,,,,,
+T-M02,"Negative assets (eligible_label True, eligible_model False)",100,105,-500,0.05,,,,,
+T-C01,Standard normal exceedance at c=1.0,,,,,normal,0,1,1.0,0.0
+T-C02,Laplace exceedance at c=1.0,,,,,laplace,0,1,1.0,0.0
+T-H01,"Hurdle normal mixture (pi_zero=0.4, c=1.0)",,,,,normal,0,1,1.0,0.4
+T-P01,Asymmetric post-denominator cut (positive PAT_pre),100,,1000,0.05,,,,,
+T-P02,Asymmetric post-denominator cut (negative PAT_pre),-100,,1000,0.05,,,,,
+T-N01,Monotonic nested exceedance probabilities (Normal),,,,,normal,0,1,0.05,0.0
