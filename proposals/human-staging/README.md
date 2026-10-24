@@ -30,7 +30,8 @@ python proposals/human-staging/stage_data.py \
   --out-test-features "data/source/test_features_candidate.parquet" \
   --out-sealed "/path/to/secure_vault/test_outcomes_sealed.parquet" \
   --receipt "contracts/staged_holdout_receipt.md" \
-  --manifest "contracts/input_manifest.sha256"
+  --manifest "contracts/input_manifest.sha256" \
+  --allowlist "/path/to/human_approved_test_feature_columns.txt"
 ```
 
 ### Verification Pipeline
@@ -39,8 +40,8 @@ Before releasing the staged files to the repository:
    ```bash
    python -m pytest proposals/human-staging/test_staging.py -v
    ```
-2. Verify that the output `test_features_candidate.parquet` contains zero forbidden outcome columns (`pat_post`, `delta`, `y_k*`).
-3. Disconnect or unmount the master dataset and sealed vault storage from the agent's environment.
+2. Review the human-owned allowlist file before execution: **one released source column per line**, explicitly covering firm keys, verified pre-audit inputs and point-in-time-approved historical features only. An absent allowlist makes staging fail closed. Verify that the test feature dataset contains no audited/current-year or outcome-derived source columns (including `fs_aud_*` and `audit_adj_*`).
+3. Disconnect or unmount the master dataset and sealed vault storage from the agent's environment. The script's receipt proves only **file creation and schema redaction**, not OS access isolation. An independent access-denial probe, approved row/column mapping, and human receipt are required before claiming isolation verified.
 
 ---
 
