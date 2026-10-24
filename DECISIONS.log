@@ -1,0 +1,5 @@
+# DECISIONS LOG
+# Format: [ISO8601 Timestamp] [Gate] [Proposal] [Evidence] [Impact]
+
+[2026-10-24T18:21:00+07:00] [G0] [Initialize repository layout as specified in Section 3] [Workspace initialized with only docs/HTA_IMPLEMENTATION_SPEC_v1.2.md present] [Created directory skeleton (config, reference, fixtures, src/hta, tests, data, outputs, gates, logs, contracts) to enable contract audit and staging checks]
+[2026-10-24T18:21:00+07:00] [G0] [STOP CLOSED on Gate G0 due to missing companion bundle and missing staged holdout] [Audit of repository shows config/protocol.yaml, config/columns.yaml, reference/hta_ref.py, reference/test_hta_ref.py, fixtures/, contracts/gate_acceptance_manifest.yaml, and staged data are not yet supplied] [Prevented autonomous synthesis of unapproved reference functions or unapproved fixtures per Rules A1, A2, A3, §15, §16.2, and §17.5]
