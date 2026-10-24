@@ -26,10 +26,10 @@ temporal_windows:
     F3: { train: [2015, 2016, 2017, 2018, 2019, 2020], val: [2021] }
     F4: { train: [2015, 2016, 2017, 2018, 2019, 2020, 2021], val: [2022] }
 
-outcome_specification:
-  primary_threshold_k: 0.05
-  threshold_grid: [0.05, 0.075, 0.10, 0.15, 0.20]
-  zero_adjustment_tolerance: 0.0   # D07: Frozen before G1; exact zero convention
+outcome:
+  primary_k: 0.05
+  thresholds: [0.05, 0.075, 0.10, 0.15, 0.20]
+  zero_tol: 0.0   # D07: Frozen before G1; exact zero convention
   target_scale: "D = delta / total_assets_pre"
   normalized_threshold: "c_k = k * |pat_pre| / total_assets_pre"
   target_transform:
