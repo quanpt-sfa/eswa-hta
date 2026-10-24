@@ -1294,31 +1294,237 @@ def _verify_c_k050_values(
 
 
 def _verify_lag_lineage(
-    feature_name: str, lag_n: int, mapping: Dict[str, str], ev: Dict[str, Any], cutoffs_scalar: pd.Timestamp
+    feature_name: str,
+    lag_n: int,
+    mapping: Dict[str, str],
+    ev: Dict[str, Any],
+    cutoffs_scalar: pd.Timestamp,
+    rtol: float = DEFAULT_LINEAGE_RTOL,
+    atol: float = DEFAULT_LINEAGE_ATOL,
 ) -> Tuple[Optional[str], str]:
+    """
+    Verifies historical lag lineage:
+      A. Semantic and temporal linkage (issuer, lag offset, reporting scope, cutoff).
+      B. Authoritative historical source records (no unverified order, one-to-one join).
+      C. Actual stored feature values vs. historical source or derived values.
+    Metadata consistency alone returns BLOCKED_SOURCE_LINEAGE_UNVERIFIED.
+    """
     ll = ev.get("lag_lineage")
-    needed = {"firm_id", "source_firm_id", "fiscal_year", "source_fiscal_year", "source_column", "availability_date"}
+    needed = {"firm_id", "source_firm_id", "fiscal_year", "source_fiscal_year", "availability_date"}
     if not isinstance(ll, pd.DataFrame) or ll.empty or not needed.issubset(ll.columns):
-        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Lag lineage evidence (issuer, fiscal years, source identity, availability date) missing."
+        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Lag lineage evidence (issuer, fiscal years, source identity, availability date) missing or incomplete."
+
     base = _LAG_SUFFIX_RE.sub("", feature_name.lower())
-    if base not in mapping:
-        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"Base semantic '{base}' has no approved physical mapping."
+    is_d_lag = (base == "d")
+    is_yk050_lag = (base == "y_k050")
+    is_derived = is_d_lag or is_yk050_lag
+
+    # 1. Base semantic / mapping check
+    if not is_derived:
+        if base not in mapping:
+            return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"Base semantic '{base}' has no approved physical mapping."
+        expected_col = mapping[base]
+        if "source_column" in ll.columns:
+            if (ll["source_column"].astype(str) != expected_col).any():
+                return "FAILED_SOURCE_LINEAGE_INCONSISTENT", f"Lag source column differs from approved mapping '{expected_col}'."
+    else:
+        for needed_sem in ["pat_pre", "pat_post", "total_assets_pre"]:
+            if needed_sem not in mapping:
+                return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"Approved physical mapping missing for '{needed_sem}'."
+
+    # 2. Issuer check (persistent firm IDs across time)
     if (ll["firm_id"].astype(str) != ll["source_firm_id"].astype(str)).any():
         return "FAILED_SOURCE_LINEAGE_INCONSISTENT", "Lag source belongs to a different issuer."
+
+    # 3. Fiscal-year offset check
     offset = pd.to_numeric(ll["fiscal_year"], errors="coerce") - pd.to_numeric(ll["source_fiscal_year"], errors="coerce")
     if offset.isna().any() or (offset != lag_n).any():
         return "FAILED_SOURCE_LINEAGE_INCONSISTENT", f"Fiscal-year offset does not equal the declared lag {lag_n}."
-    if (ll["source_column"].astype(str) != mapping[base]).any():
-        return "FAILED_SOURCE_LINEAGE_INCONSISTENT", "Lag source column differs from the approved mapping."
+
+    # 4. Reporting scope check
+    if "scope" in ll.columns and "source_scope" in ll.columns:
+        if (ll["scope"].astype(str) != ll["source_scope"].astype(str)).any():
+            return "FAILED_SOURCE_LINEAGE_INCONSISTENT", "Reporting scope inconsistent across lag link."
+
+    # 5. Duplicate checks on current and historical primary keys
+    curr_keys = ["firm_id", "fiscal_year"]
+    if "scope" in ll.columns:
+        curr_keys.append("scope")
+    if ll.duplicated(subset=curr_keys).any():
+        return "FAILED_SOURCE_LINEAGE_INCONSISTENT", "Duplicate current records detected in lag lineage."
+
+    hist_keys = ["source_firm_id", "source_fiscal_year"]
+    if "source_scope" in ll.columns:
+        hist_keys.append("source_scope")
+    if ll.duplicated(subset=hist_keys).any():
+        return "FAILED_SOURCE_LINEAGE_INCONSISTENT", "Duplicate historical source records detected in lag lineage."
+
+    # 6. Availability date and prediction cutoff checks
     avail = pd.to_datetime(ll["availability_date"], errors="coerce", utc=True)
     if avail.isna().any():
-        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Actual availability date of the prior-year report is missing."
-    cut = pd.to_datetime(ev.get("prediction_cutoffs", cutoffs_scalar), errors="coerce", utc=True)
-    if isinstance(cut, pd.Series):
-        cut = cut.reindex(ll.index)
-    if bool((avail > cut).any()) if isinstance(cut, pd.Series) else bool((avail > cut).any()):
+        return "BLOCKED_UNRESOLVED_TIMESTAMP", "Actual availability date of the prior-year report is missing or unparseable."
+
+    if "prediction_cutoff" in ll.columns:
+        cut_series = pd.to_datetime(ll["prediction_cutoff"], errors="coerce", utc=True)
+    else:
+        cut_spec = ev.get("prediction_cutoffs", cutoffs_scalar)
+        if isinstance(cut_spec, pd.Series):
+            cut_series = pd.to_datetime(cut_spec.reindex(ll.index), errors="coerce", utc=True)
+        else:
+            cut_series = pd.Series(pd.to_datetime(cut_spec, errors="coerce", utc=True), index=ll.index)
+
+    if cut_series.isna().any():
+        return "BLOCKED_INVALID_CUTOFF", "Prediction cutoff is missing or unparseable."
+
+    if bool((avail > cut_series).any()):
         return "FAILED_TEMPORAL_LEAKAGE", "Prior-year report became available after the prediction cutoff."
-    return None, "ok"
+
+    # 7. Extract stored values for the current firm-year
+    stored_series: Optional[pd.Series] = None
+    if "stored_value" in ll.columns:
+        stored_series = pd.to_numeric(ll["stored_value"], errors="coerce")
+    elif "stored_values" in ev:
+        sv = ev["stored_values"]
+        if isinstance(sv, pd.Series):
+            stored_series = pd.to_numeric(sv.reindex(ll.index), errors="coerce")
+        elif isinstance(sv, (list, tuple, np.ndarray)):
+            stored_series = pd.Series(pd.to_numeric(sv, errors="coerce"), index=ll.index)
+    elif "source_data" in ev and isinstance(ev["source_data"], pd.DataFrame):
+        sd = ev["source_data"]
+        target_col = feature_name if feature_name in sd.columns else (mapping.get(base) if not is_derived else None)
+        if target_col and target_col in sd.columns:
+            stored_series = pd.to_numeric(sd[target_col].reindex(ll.index), errors="coerce")
+
+    if stored_series is None:
+        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Historical metadata is consistent, but stored feature values are missing (no transformation evidence)."
+
+    if stored_series.isna().any():
+        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Stored feature values are missing or incomplete for some entities in batch."
+
+    # 8. Extract historical source records and verify values
+    h_df = ev.get("historical_source_data")
+    if h_df is None and "source_data" in ev and isinstance(ev["source_data"], pd.DataFrame):
+        h_df = ev["source_data"]
+
+    if not is_derived:
+        # Simple historical audited field
+        hist_series: Optional[pd.Series] = None
+        if "source_value" in ll.columns:
+            hist_series = pd.to_numeric(ll["source_value"], errors="coerce")
+        elif "historical_value" in ll.columns:
+            hist_series = pd.to_numeric(ll["historical_value"], errors="coerce")
+        elif isinstance(h_df, pd.DataFrame):
+            col_name = mapping[base] if mapping[base] in h_df.columns else (base if base in h_df.columns else None)
+            if col_name and {"firm_id", "fiscal_year"}.issubset(h_df.columns):
+                join_keys = ["firm_id", "fiscal_year"]
+                if "scope" in h_df.columns and "source_scope" in ll.columns:
+                    join_keys.append("scope")
+                h_sub = h_df[join_keys + [col_name]].copy()
+                if h_sub.duplicated(subset=join_keys).any():
+                    return "FAILED_SOURCE_LINEAGE_INCONSISTENT", "Duplicate historical records found in historical source data."
+
+                left_keys = ["source_firm_id", "source_fiscal_year"]
+                if "source_scope" in ll.columns and "scope" in h_df.columns:
+                    left_keys.append("source_scope")
+
+                merged = pd.merge(
+                    ll.reset_index()[["index"] + left_keys],
+                    h_sub,
+                    left_on=left_keys,
+                    right_on=join_keys,
+                    how="left"
+                ).set_index("index")
+
+                if merged[col_name].isna().any():
+                    return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Historical source record missing for some required entities."
+                hist_series = pd.to_numeric(merged[col_name].reindex(ll.index), errors="coerce")
+
+        if hist_series is None:
+            return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Historical metadata is consistent, but actual historical source records/values are missing."
+
+        if hist_series.isna().any():
+            return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", "Historical source values missing for some required entities in batch."
+
+        act = stored_series.to_numpy(dtype=float)
+        exp = hist_series.to_numpy(dtype=float)
+        if np.isclose(act, exp, rtol=rtol, atol=atol, equal_nan=True).all():
+            return None, "ok"
+        return "FAILED_TRANSFORMATION_MISMATCH", "Stored lagged feature values do not match historical source values."
+
+    # Derived historical features (D_lag1, y_k050_lag1)
+    hist_inputs: Dict[str, pd.Series] = {}
+    for sem in ["pat_pre", "pat_post", "total_assets_pre"]:
+        phys = mapping[sem]
+        if f"{sem}_hist" in ll.columns:
+            hist_inputs[sem] = pd.to_numeric(ll[f"{sem}_hist"], errors="coerce")
+        elif f"historical_{sem}" in ll.columns:
+            hist_inputs[sem] = pd.to_numeric(ll[f"historical_{sem}"], errors="coerce")
+        elif isinstance(h_df, pd.DataFrame) and {"firm_id", "fiscal_year"}.issubset(h_df.columns):
+            target_col = phys if phys in h_df.columns else (sem if sem in h_df.columns else None)
+            if target_col:
+                join_keys = ["firm_id", "fiscal_year"]
+                if "scope" in h_df.columns and "source_scope" in ll.columns:
+                    join_keys.append("scope")
+                left_keys = ["source_firm_id", "source_fiscal_year"]
+                if "source_scope" in ll.columns and "scope" in h_df.columns:
+                    left_keys.append("source_scope")
+                merged = pd.merge(
+                    ll.reset_index()[["index"] + left_keys],
+                    h_df[join_keys + [target_col]],
+                    left_on=left_keys,
+                    right_on=join_keys,
+                    how="left"
+                ).set_index("index")
+                if not merged[target_col].isna().any():
+                    hist_inputs[sem] = pd.to_numeric(merged[target_col].reindex(ll.index), errors="coerce")
+
+    if len(hist_inputs) < 3:
+        return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"Approved historical inputs missing for derived lag feature '{feature_name}'."
+
+    pat_pre_h = hist_inputs["pat_pre"]
+    pat_post_h = hist_inputs["pat_post"]
+    assets_h = hist_inputs["total_assets_pre"]
+    delta_h = pat_post_h - pat_pre_h
+
+    if is_d_lag:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            expected_d = np.where(assets_h > 0, delta_h / assets_h, np.nan)
+        act = stored_series.to_numpy(dtype=float)
+        exp = np.asarray(expected_d, dtype=float)
+        if np.isclose(act, exp, rtol=rtol, atol=atol, equal_nan=True).all():
+            return None, "ok"
+        return "FAILED_TRANSFORMATION_MISMATCH", "Stored D_lag1 does not match independently recomputed historical adjustment outcome."
+
+    if is_yk050_lag:
+        usable = pat_pre_h.notna() & pat_post_h.notna()
+        pre_zero = usable & (pat_pre_h == 0.0)
+        sign_change = usable & (pat_pre_h * pat_post_h < 0.0)
+        eligible = usable & (~pre_zero) & (~sign_change)
+        expected_y = np.where(eligible, (np.abs(delta_h) >= 0.05 * np.abs(pat_pre_h)).astype(float), np.nan)
+
+        # Check for current-year outcome leakage
+        curr_df = ev.get("curr_source_data", ev.get("source_data"))
+        if isinstance(curr_df, pd.DataFrame):
+            p_pre_c = mapping["pat_pre"] if mapping["pat_pre"] in curr_df.columns else "pat_pre"
+            p_post_c = mapping["pat_post"] if mapping["pat_post"] in curr_df.columns else "pat_post"
+            if p_pre_c in curr_df.columns and p_post_c in curr_df.columns:
+                pat_pre_curr = pd.to_numeric(curr_df[p_pre_c].reindex(ll.index), errors="coerce")
+                pat_post_curr = pd.to_numeric(curr_df[p_post_c].reindex(ll.index), errors="coerce")
+                d_curr = pat_post_curr - pat_pre_curr
+                u_curr = pat_pre_curr.notna() & pat_post_curr.notna()
+                e_curr = u_curr & (pat_pre_curr != 0) & (pat_pre_curr * pat_post_curr >= 0)
+                y_curr = np.where(e_curr, (np.abs(d_curr) >= 0.05 * np.abs(pat_pre_curr)).astype(float), np.nan)
+                if np.isclose(stored_series, y_curr, equal_nan=True).all() and not np.isclose(stored_series, expected_y, equal_nan=True).all():
+                    return "FAILED_LEAKAGE_AUDITED_INPUT", "y_k050_lag1 was calculated using current-year audited outcomes instead of historical outcomes."
+
+        act = stored_series.to_numpy(dtype=float)
+        exp = np.asarray(expected_y, dtype=float)
+        if np.isclose(act, exp, rtol=rtol, atol=atol, equal_nan=True).all():
+            return None, "ok"
+        return "FAILED_TRANSFORMATION_MISMATCH", "Stored y_k050_lag1 does not match independently recomputed historical label."
+
+    return "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", f"No registered deterministic transformation for derived lag feature '{feature_name}'."
+
 
 
 def verify_feature_provenance(
@@ -1454,11 +1660,11 @@ def verify_feature_provenance(
         return unverified(f"Authoritative column mapping unavailable: {why}.")
 
     if declared_hist_lag:
-        status, reason = _verify_lag_lineage(f_lower, int(lag_match.group(1)), mapping, ev, cutoff)
+        status, reason = _verify_lag_lineage(f_lower, int(lag_match.group(1)), mapping, ev, cutoff, rtol=rtol, atol=atol)
         if status:
             return _prov_result(feature_name, status, reason, dict(subchecks, source_lineage=status))
         return _prov_result(feature_name, _PROVENANCE_RELEASE_STATUS,
-                            "Historical audited lag verified from issuer, fiscal-year offset, source identity and availability date.",
+                            "Historical audited lag verified from issuer, fiscal-year offset, source identity, availability date, and verified source values.",
                             dict(subchecks, source_lineage=_PROVENANCE_RELEASE_STATUS))
 
     data = ev.get("source_data")

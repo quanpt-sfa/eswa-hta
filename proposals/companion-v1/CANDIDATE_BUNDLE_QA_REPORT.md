@@ -2,26 +2,26 @@
 ======================================
 
 **Document:** `proposals/companion-v1/CANDIDATE_BUNDLE_QA_REPORT.md`  
-**Date:** 2026-10-24  
-**Author:** Coding & QA Agent (Final Targeted Repair — False-PASS Elimination)  
-**Working Branch:** `fix/final-false-pass-repair`  
-**Base Commit:** `01554335c1b3e083c953f58db7eced63b1e758ed`  
+**Date:** 2026-10-25  
+**Author:** Coding & QA Agent (Final Engineering Closure — Historical Lag Verified Values)  
+**Working Branch:** `fix/final-engineering-closure`  
+**Base Commit:** `c735cab6a5246af1f1c65533135cf6ce8ee308e6`  
 **Target Proposal:** `proposals/companion-v1/` and `proposals/human-staging/`  
-**Status:** `CANDIDATE_QA_PASSED_PENDING_EXTERNAL_APPROVAL` (130/130 Unit & Adversarial Tests PASSED; G0 Preflight STOP_BLOCKER)
+**Status:** `CANDIDATE_QA_PASSED_PENDING_EXTERNAL_APPROVAL` (132/132 Unit & Adversarial Tests PASSED; G0 Preflight STOP_BLOCKER)
 
 ---
 
 ## 1. Test Suite Summary (Executed Full Suite)
 
-- **Previous Baseline:** 70 passed
-- **New Tests / Assertions Added:** +60 tests (+145 assertions)
-  - `test_api_preflight.py`: +46 tests (expanded from 16 to 62 passed, covering mock execution blocking, two-model checkpoint identity via `model_path_` and hash, strict workload schema without arbitrary defaults, GPU peak VRAM recording, and aggregation invariants)
-  - `test_hta_ref.py`: +14 tests (expanded from 26 to 40 passed, covering separation of declared provenance from verified source lineage, $c_{k050}$ deterministic validator with independent recomputation, units/scope/stage validation, historical lag lineage verification, and boundary-token scanner)
+- **Previous Baseline:** 130 passed
+- **New Tests / Assertions Added:** +2 tests (+18 adversarial assertions)
+  - `test_api_preflight.py`: 62 passed (mock execution blocking, two-model checkpoint identity via `model_path_` and hash, strict workload schema without arbitrary defaults, GPU peak VRAM recording, and aggregation invariants)
+  - `test_hta_ref.py`: 42 passed (expanded from 40 to 42 passed, adding Test A, Test B, and 18 adversarial test cases for historical lag source-value lineage, persistent firm IDs, scope/year consistency, duplicate rejection, and derived lag recomputation)
   - `test_staging.py`: 20 passed
   - `test_protocol_contract.py`: 3 passed
   - `test_fixture_schema.py`: 5 passed
-- **Final Collected Tests:** 130
-- **Passed:** 130
+- **Final Collected Tests:** 132
+- **Passed:** 132
 - **Failed:** 0
 - **Skipped:** 0
 - **Overall Exit Code:** 0
@@ -219,12 +219,33 @@ python -m pytest proposals/ -v
 
 ---
 
-## 6. Current Dispositions
+## 6. Final Engineering Closure — Historical Lag Verified Source-Value Lineage
 
-- **Engineering Code Correctness:** `ENGINEERING_REPAIR_VERIFIED`
-  - 130/130 candidate tests passed across all modules.
-  - Python compileall succeeded without syntax errors or warnings.
-  - Zero fabricated passes; mock-only execution strictly bounded to orchestration testing.
+### 6.1 Confirmed Defect in Baseline Implementation
+- **Original defect:** In `_verify_lag_lineage()` (`hta_ref.py`), the function verified structural metadata (`firm_id`, `source_firm_id`, `fiscal_year`, `source_fiscal_year`, `source_column`, `availability_date`) but did not inspect actual historical source values or stored feature values. Supplying a metadata-only DataFrame resulted in `VERIFIED_SOURCE_LINEAGE` and `release_authorized: True`, enabling false-PASS for unverified lag values.
+- **Remediation:**
+  - Separated metadata consistency from source-value lineage verification. Metadata consistency alone strictly returns `BLOCKED_SOURCE_LINEAGE_UNVERIFIED` with `release_authorized: False`.
+  - Implemented 4-stage verification:
+    1. **Linkage & Temporal Integrity:** Persistent firm IDs (`firm_id == source_firm_id`), exact fiscal year lag offset (`fiscal_year - source_fiscal_year == lag_n`), consistent reporting scope (`scope == source_scope`), duplicate detection on current/historical primary keys, and publication availability $\le$ cutoff.
+    2. **Authoritative Historical Source Records:** Mandatory historical source data joined explicitly on persistent firm ID and fiscal year (invariant to DataFrame row ordering; rejects 1-to-many or ambiguous matches).
+    3. **Stored Feature-Value Verification:** Stored feature values for the current firm-year must exactly match the historical source record for simple lags (`fs_aud_profit_lag1`), or the independently recomputed outcome for derived lags (`D_lag1`, `y_k050_lag1`).
+    4. **Current-Year Outcome Leakage Guard:** Proves that lagged targets (e.g. `y_k050_lag1`) were derived from historical outcomes rather than current-year audit results; returns `FAILED_LEAKAGE_AUDITED_INPUT` if current-year audit outcomes were substituted.
+  - Replaced the defective unit test `test_historical_lag_verified_only_with_full_lineage()` with:
+    - **Test A:** Metadata-only historical lag $\to$ asserts `BLOCKED_SOURCE_LINEAGE_UNVERIFIED` and `release_authorized is False`.
+    - **Test B:** Fully verified historical lag $\to$ asserts `VERIFIED_SOURCE_LINEAGE` and `release_authorized is True`; tampered stored value $\to$ asserts `FAILED_TRANSFORMATION_MISMATCH`.
+    - **18 Adversarial Tests:** Covering all failure modes (metadata only, value match, value mismatch, wrong issuer, wrong year, wrong scope, duplicate historical records, missing records, missing/unparseable timestamps, post-cutoff publication, missing derived inputs, valid `D_lag1`, valid `y_k050_lag1`, current-year audit leakage, shuffled row order join invariance, multi-row partial batch failure, and unapproved mapping).
+
+---
+
+## 7. Final Dispositions
+
+- **Engineering Code Correctness:** `ENGINEERING_G0_CANDIDATE_CLOSED`
+  - 132/132 candidate tests passed across all modules (`proposals/`).
+  - Python compileall succeeded with exit code 0.
+  - Zero fabricated passes; mock-only execution strictly bounded to orchestration testing (`MOCK_ORCHESTRATION_PASSED`).
+  - Every release-authorizing feature path (including $c_{k050}$ and historical lags) requires verified source records and numerical equality against independent recomputations.
+  - Engineering closure criteria satisfied.
 - **Real-World Gate G0 Readiness:** `G0_STOP_BLOCKER`
   - Preflight on actual host remains blocked due to missing external dependencies (`tabicl`, `catboost`, `ngboost`), missing approved model checkpoints (`TabICLRegressor`, `TabICLClassifier`), and unapproved physical column mapping in `columns.yaml`.
   - In accordance with specification rules, no candidate artifacts have been promoted to root paths, and no autonomous approval has been claimed.
+

@@ -822,28 +822,165 @@ def _lag_meta():
 
 
 def _lag_df(**over):
-    d = {"firm_id": ["A"], "source_firm_id": ["A"], "fiscal_year": [2020], "source_fiscal_year": [2019],
-         "source_column": ["lnst_aud"], "availability_date": ["2020-03-01"]}
+    d = {
+        "firm_id": ["A"],
+        "source_firm_id": ["A"],
+        "fiscal_year": [2020],
+        "source_fiscal_year": [2019],
+        "source_column": ["lnst_aud"],
+        "availability_date": ["2020-03-01"],
+    }
     d.update(over)
     return pd.DataFrame(d)
 
 
-def test_historical_lag_verified_only_with_full_lineage():
+# ---- Section 3: Historical Lag Verified Source-Value Tests ----
+
+def test_historical_lag_metadata_only_blocked():
+    """Test A: Metadata-only historical lag without verified values must be BLOCKED."""
     ev = {"columns_config": _cfg(), "lag_lineage": _lag_df()}
     res = _verify(_lag_meta(), ev, name="fs_aud_profit_lag1")
-    assert res["status"] == "VERIFIED_SOURCE_LINEAGE", res
-    # no lineage evidence -> blocked
-    assert _verify(_lag_meta(), None, name="fs_aud_profit_lag1")["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
-    # wrong issuer / wrong fiscal-year offset / wrong source column / late or missing availability
-    for over, expected in [
-        ({"source_firm_id": ["B"]}, "FAILED_SOURCE_LINEAGE_INCONSISTENT"),
-        ({"source_fiscal_year": [2018]}, "FAILED_SOURCE_LINEAGE_INCONSISTENT"),
-        ({"source_column": ["lnst_post"]}, "FAILED_SOURCE_LINEAGE_INCONSISTENT"),
-        ({"availability_date": ["2020-04-20"]}, "FAILED_TEMPORAL_LEAKAGE"),
-        ({"availability_date": [None]}, "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"),
-    ]:
-        r = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": _lag_df(**over)}, name="fs_aud_profit_lag1")
-        assert r["status"] == expected, (over, r)
+    assert res["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED", res
+    assert res["release_authorized"] is False
+    assert not hta_ref.feature_release_authorized(res)
+
+
+def test_historical_lag_fully_verified_and_mismatch():
+    """Test B: Fully verified historical source values authorize release; value tampering fails."""
+    # 1. Matching historical source and stored value
+    df_valid = _lag_df(source_value=[120.0], stored_value=[120.0])
+    ev_valid = {"columns_config": _cfg(), "lag_lineage": df_valid}
+    res_valid = _verify(_lag_meta(), ev_valid, name="fs_aud_profit_lag1")
+    assert res_valid["status"] == "VERIFIED_SOURCE_LINEAGE", res_valid
+    assert res_valid["release_authorized"] is True
+    assert hta_ref.feature_release_authorized(res_valid)
+
+    # 2. Tampered stored feature value (121.0 != 120.0) -> FAILED_TRANSFORMATION_MISMATCH
+    df_tampered = _lag_df(source_value=[120.0], stored_value=[121.0])
+    ev_tampered = {"columns_config": _cfg(), "lag_lineage": df_tampered}
+    res_tampered = _verify(_lag_meta(), ev_tampered, name="fs_aud_profit_lag1")
+    assert res_tampered["status"] == "FAILED_TRANSFORMATION_MISMATCH", res_tampered
+    assert res_tampered["release_authorized"] is False
+
+
+def test_historical_lag_adversarial_suite():
+    """18 mandatory adversarial tests for historical lag lineage verification."""
+    # 1. Historical metadata correct but no source data -> BLOCKED
+    res1 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": _lag_df()}, name="fs_aud_profit_lag1")
+    assert res1["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+
+    # 2. Historical source and stored value match -> VERIFIED
+    df2 = _lag_df(source_value=[120.0], stored_value=[120.0])
+    res2 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df2}, name="fs_aud_profit_lag1")
+    assert res2["status"] == "VERIFIED_SOURCE_LINEAGE"
+    assert res2["release_authorized"] is True
+
+    # 3. Source and stored value differ -> FAILED
+    df3 = _lag_df(source_value=[120.0], stored_value=[125.0])
+    res3 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df3}, name="fs_aud_profit_lag1")
+    assert res3["status"] == "FAILED_TRANSFORMATION_MISMATCH"
+
+    # 4. Wrong issuer -> FAILED
+    df4 = _lag_df(source_firm_id=["B"], source_value=[120.0], stored_value=[120.0])
+    res4 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df4}, name="fs_aud_profit_lag1")
+    assert res4["status"] == "FAILED_SOURCE_LINEAGE_INCONSISTENT"
+
+    # 5. Wrong fiscal year offset -> FAILED
+    df5 = _lag_df(source_fiscal_year=[2018], source_value=[120.0], stored_value=[120.0])
+    res5 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df5}, name="fs_aud_profit_lag1")
+    assert res5["status"] == "FAILED_SOURCE_LINEAGE_INCONSISTENT"
+
+    # 6. Wrong reporting scope -> FAILED
+    df6 = _lag_df(scope=["consolidated"], source_scope=["separate"], source_value=[120.0], stored_value=[120.0])
+    res6 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df6}, name="fs_aud_profit_lag1")
+    assert res6["status"] == "FAILED_SOURCE_LINEAGE_INCONSISTENT"
+
+    # 7. Duplicate historical source records -> FAILED
+    df7 = pd.concat([df2, df2], ignore_index=True)
+    res7 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df7}, name="fs_aud_profit_lag1")
+    assert res7["status"] == "FAILED_SOURCE_LINEAGE_INCONSISTENT"
+
+    # 8. Historical source record missing -> BLOCKED
+    df8 = _lag_df(stored_value=[120.0])
+    h_data8 = pd.DataFrame({"firm_id": ["OTHER"], "fiscal_year": [2019], "lnst_aud": [120.0]})
+    res8 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df8, "historical_source_data": h_data8}, name="fs_aud_profit_lag1")
+    assert res8["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+
+    # 9. Historical publication date missing -> BLOCKED
+    df9 = _lag_df(availability_date=[None], source_value=[120.0], stored_value=[120.0])
+    res9 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df9}, name="fs_aud_profit_lag1")
+    assert res9["status"] == "BLOCKED_UNRESOLVED_TIMESTAMP"
+
+    # 10. Historical publication date after cutoff -> FAILED
+    df10 = _lag_df(availability_date=["2020-04-15"], source_value=[120.0], stored_value=[120.0])
+    res10 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df10}, name="fs_aud_profit_lag1")
+    assert res10["status"] == "FAILED_TEMPORAL_LEAKAGE"
+
+    # 11. D_lag1 without approved transformation / inputs -> BLOCKED
+    df11 = _lag_df(stored_value=[0.05])
+    meta_d = {"source_columns": ["D_lag1"], "formula": "lag1(D)", "temporal_status": "lag", "reporting_scope": "historical_audited_lag", "publication_date": "2020-03-15"}
+    res11 = _verify(meta_d, {"columns_config": _cfg(), "lag_lineage": df11}, name="D_lag1")
+    assert res11["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+
+    # 12. D_lag1 with approved formula and actual historical inputs -> VERIFIED
+    # pat_pre=100.0, pat_post=150.0, assets=1000.0 -> delta=50.0, D=0.05
+    df12 = _lag_df(stored_value=[0.05], pat_pre_hist=[100.0], pat_post_hist=[150.0], total_assets_pre_hist=[1000.0])
+    res12 = _verify(meta_d, {"columns_config": _cfg(), "lag_lineage": df12}, name="D_lag1")
+    assert res12["status"] == "VERIFIED_SOURCE_LINEAGE", res12
+    assert res12["release_authorized"] is True
+
+    # 13. y_k050_lag1 with correct historical label recomputation -> VERIFIED
+    # pat_pre=100.0, pat_post=150.0, assets=1000.0 -> delta=50.0 >= 0.05*100=5.0 -> y=1.0
+    df13 = _lag_df(stored_value=[1.0], pat_pre_hist=[100.0], pat_post_hist=[150.0], total_assets_pre_hist=[1000.0])
+    meta_y = {"source_columns": ["y_k050_lag1"], "formula": "lag1(y_k050)", "temporal_status": "lag", "reporting_scope": "historical_audited_lag", "publication_date": "2020-03-15"}
+    res13 = _verify(meta_y, {"columns_config": _cfg(), "lag_lineage": df13}, name="y_k050_lag1")
+    assert res13["status"] == "VERIFIED_SOURCE_LINEAGE", res13
+    assert res13["release_authorized"] is True
+
+    # 14. y_k050_lag1 using current-year audit information -> FAILED
+    # historical year: delta=50 >= 5 -> y=1.0. current year: pat_post=101, pat_pre=100 -> delta=1 < 5 -> y=0.0
+    # stored_value = 0.0 (leaked from current year)
+    df14 = _lag_df(stored_value=[0.0], pat_pre_hist=[100.0], pat_post_hist=[150.0], total_assets_pre_hist=[1000.0])
+    curr_data14 = pd.DataFrame({"lnst_pre": [100.0], "lnst_post": [101.0], "tts_pre": [1000.0]})
+    res14 = _verify(meta_y, {"columns_config": _cfg(), "lag_lineage": df14, "curr_source_data": curr_data14}, name="y_k050_lag1")
+    assert res14["status"] == "FAILED_LEAKAGE_AUDITED_INPUT"
+
+    # 15. Multiple firms and years with shuffled row order -> correct matching
+    df15 = pd.DataFrame({
+        "firm_id": ["B", "A"], "source_firm_id": ["B", "A"],
+        "fiscal_year": [2020, 2020], "source_fiscal_year": [2019, 2019],
+        "source_column": ["lnst_aud", "lnst_aud"], "availability_date": ["2020-03-01", "2020-03-01"],
+        "stored_value": [200.0, 100.0]
+    })
+    h_data15 = pd.DataFrame({
+        "firm_id": ["A", "B"], "fiscal_year": [2019, 2019], "lnst_aud": [100.0, 200.0]
+    })
+    res15 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df15, "historical_source_data": h_data15}, name="fs_aud_profit_lag1")
+    assert res15["status"] == "VERIFIED_SOURCE_LINEAGE", res15
+    assert res15["release_authorized"] is True
+
+    # 16. Partially missing lineage in a multi-row batch -> no release of affected batch
+    df16 = pd.DataFrame({
+        "firm_id": ["A", "B"], "source_firm_id": ["A", "B"],
+        "fiscal_year": [2020, 2020], "source_fiscal_year": [2019, 2019],
+        "source_column": ["lnst_aud", "lnst_aud"], "availability_date": ["2020-03-01", "2020-03-01"],
+        "stored_value": [100.0, 200.0]
+    })
+    h_data16 = pd.DataFrame({"firm_id": ["A"], "fiscal_year": [2019], "lnst_aud": [100.0]})  # B missing!
+    res16 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df16, "historical_source_data": h_data16}, name="fs_aud_profit_lag1")
+    assert res16["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    assert res16["release_authorized"] is False
+
+    # 17. Correct declared formula but incorrect stored numerical values -> FAILED
+    df17 = _lag_df(source_value=[120.0], stored_value=[999.0])
+    res17 = _verify(_lag_meta(), {"columns_config": _cfg(), "lag_lineage": df17}, name="fs_aud_profit_lag1")
+    assert res17["status"] == "FAILED_TRANSFORMATION_MISMATCH"
+
+    # 18. Unapproved mapping or unverifiable source provenance -> BLOCKED
+    res18 = _verify(_lag_meta(), {"columns_config": _cfg(approved=False), "lag_lineage": df2}, name="fs_aud_profit_lag1")
+    assert res18["status"] == "BLOCKED_SOURCE_LINEAGE_UNVERIFIED"
+    assert res18["release_authorized"] is False
+
 
 
 def test_scan_feature_names_boundary_and_exact_allowlist():
