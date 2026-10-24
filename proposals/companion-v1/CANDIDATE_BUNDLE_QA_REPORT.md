@@ -1,4 +1,4 @@
-# Candidate Companion Bundle QA Report
+> **REVIEW-BRANCH NOTICE (2026-10-24):** The 19 PASS results below are historical results reported by the implementation agent for commit `7ea7fe0`. Candidate implementation, configs, staging, and tests have been changed on `review/g0-independent-audit-fixes`. **No post-patch pytest run has been verified.** Do not reuse these historical PASS results as evidence for G0 approval. See `contracts/INDEPENDENT_G0_AUDIT_20261024.md` for confirmed corrections and open blockers.\n\n# Candidate Companion Bundle QA Report
 
 **Document:** `proposals/companion-v1/CANDIDATE_BUNDLE_QA_REPORT.md`  
 **Date:** 2026-10-24  
