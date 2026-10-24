@@ -618,6 +618,52 @@ def test_x2_leakage_scanner_and_provenance_contract():
     res_unknown = hta_ref.verify_feature_provenance("fs_aud_profit_lag1", hist_aud_unknown, prediction_cutoff="2020-03-31")
     assert res_unknown["status"] == "BLOCKED_UNRESOLVED_TIMESTAMP"
 
+    # 10. Defect B Regression: Legitimate pre-audit features containing 'd' must NOT be falsely rejected
+    for legit_feat in ["fixed_assets_pre", "dividend_pre", "debt_pre", "depreciation_pre", "rnd_pre"]:
+        rec = {
+            "source_columns": [legit_feat],
+            "formula": legit_feat,
+            "reporting_scope": "pre_audit",
+            "temporal_status": "t_pre",
+            "publication_date": "2020-03-15",
+        }
+        res_legit_d = hta_ref.verify_feature_provenance(legit_feat, rec, prediction_cutoff="2020-03-31")
+        assert res_legit_d["status"] == "PASSED", f"Expected PASSED for {legit_feat}, got {res_legit_d}"
+
+    # 11. Missing prediction cutoff fails closed
+    rec_valid = {
+        "source_columns": ["fixed_assets_pre"],
+        "formula": "fixed_assets_pre",
+        "reporting_scope": "pre_audit",
+        "temporal_status": "t_pre",
+        "publication_date": "2020-03-15",
+    }
+    res_no_cutoff = hta_ref.verify_feature_provenance("fixed_assets_pre", rec_valid, prediction_cutoff=None)
+    assert res_no_cutoff["status"] == "BLOCKED_INVALID_CUTOFF"
+
+    # 12. Declared metadata alone cannot certify an outcome variable as pre-audit
+    for outcome_feat in ["pat_post", "delta", "d", "is_zero_adj", "y_k050"]:
+        rec_outcome = {
+            "source_columns": [outcome_feat],
+            "formula": outcome_feat,
+            "reporting_scope": "pre_audit",
+            "temporal_status": "t_pre",
+            "publication_date": "2020-03-15",
+        }
+        res_outcome = hta_ref.verify_feature_provenance(outcome_feat, rec_outcome, prediction_cutoff="2020-03-31")
+        assert res_outcome["status"] == "FAILED_LEAKAGE_AUDITED_INPUT"
+
+    # 13. Unregistered c_k075 threshold predictor is blocked in X2
+    rec_c_k075 = {
+        "source_columns": ["pat_pre", "total_assets_pre"],
+        "formula": "0.075 * abs(pat_pre) / total_assets_pre",
+        "reporting_scope": "pre_audit",
+        "temporal_status": "t_pre",
+        "publication_date": "2020-03-15",
+    }
+    res_c_k075 = hta_ref.verify_feature_provenance("c_k075", rec_c_k075, prediction_cutoff="2020-03-31")
+    assert res_c_k075["status"] == "FAILED_LEAKAGE_AUDITED_INPUT" or "BLOCK" in res_c_k075["status"]
+
 
 def test_near_zero_temporal_fold_isolation_and_final_edges():
     # Build synthetic panel from 2015 to 2025

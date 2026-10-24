@@ -242,24 +242,22 @@ def probe_api_compatibility(
                 "total_vram_gb": 0.0,
             }
 
-        # Level 2: Synthetic inference smoke test
+        # Level 2: Synthetic inference smoke test (Basic CUDA functionality only)
         if cuda_avail and run_inference_smoke:
             try:
-                torch.cuda.reset_peak_memory_stats(0)
-                # Synthetic smoke test on GPU device
+                # Basic matrix multiply smoke test on GPU device
                 t_dummy = torch.randn((20, 5), device="cuda:0")
                 _ = torch.matmul(t_dummy, t_dummy.T)
-                peak_mb = round(torch.cuda.max_memory_allocated(0) / (1024**2), 2)
-                report["environment"]["peak_vram_allocated_mb"] = peak_mb
                 hw_report["level2_synthetic_smoke"] = {
                     "status": "PASSED",
-                    "peak_vram_allocated_mb": peak_mb,
                     "smoke_test_device": "cuda:0",
+                    "cuda_functional": True,
                 }
             except Exception as e:
                 hw_report["level2_synthetic_smoke"] = {
-                    "status": "FAILED_INFERENCE_SMOKE",
+                    "status": "FAILED_CUDA_SMOKE",
                     "error": str(e),
+                    "cuda_functional": False,
                 }
         else:
             hw_report["level2_synthetic_smoke"] = {
@@ -268,35 +266,144 @@ def probe_api_compatibility(
             }
 
         # Level 3: Registered workload feasibility
-        # Preapproved context size, estimator count, batch size, offload strategy, deployment config
-        if (
-            hw_report["level1_hardware_detection"]["status"] == "PASSED"
-            and hw_report["level2_synthetic_smoke"]["status"] == "PASSED"
-            and workload_config is not None
-            and report["components"].get("Checkpoint", {}).get("status") == "PASSED"
-            and run_workload_test
-        ):
-            peak_mb = report["environment"]["peak_vram_allocated_mb"]
-            max_allowed_mb = workload_config.get("max_memory_mb", 11000.0)
-            if peak_mb <= max_allowed_mb:
-                hw_report["level3_registered_workload"] = {
-                    "status": "PASSED",
-                    "workload_config": workload_config,
-                    "peak_vram_allocated_mb": peak_mb,
-                    "memory_limit_mb": max_allowed_mb,
-                }
-            else:
-                hw_report["level3_registered_workload"] = {
-                    "status": "FAILED_EXCEEDS_MEMORY_LIMIT",
-                    "workload_config": workload_config,
-                    "peak_vram_allocated_mb": peak_mb,
-                    "memory_limit_mb": max_allowed_mb,
-                }
-        else:
+        # Requires execution of actual registered TabICLv2 configuration on GPU
+        ckpt_status = report["components"].get("Checkpoint", {}).get("status")
+        if not run_workload_test:
             hw_report["level3_registered_workload"] = {
                 "status": "BLOCKED_WORKLOAD_UNVERIFIED",
-                "reason": "Registered workload configuration or approved checkpoint missing/untested; toy fit does not satisfy Level 3",
+                "reason": "Registered workload verification was not requested via CLI (--run-workload-test).",
             }
+        elif workload_config is None:
+            hw_report["level3_registered_workload"] = {
+                "status": "BLOCKED_WORKLOAD_UNVERIFIED",
+                "reason": "Registered workload configuration missing; toy fit does not satisfy Level 3.",
+            }
+        elif hw_report["level1_hardware_detection"]["status"] != "PASSED":
+            hw_report["level3_registered_workload"] = {
+                "status": "BLOCKED_CUDA_UNAVAILABLE",
+                "reason": "CUDA is unavailable on this host; Level 3 requires GPU execution.",
+            }
+        elif hw_report["level2_synthetic_smoke"]["status"] != "PASSED":
+            hw_report["level3_registered_workload"] = {
+                "status": "BLOCKED_INFERENCE_UNTESTED",
+                "reason": "Level 2 CUDA smoke test must pass before registered workload execution.",
+            }
+        elif ckpt_status == "FAILED_CHECKPOINT_HASH":
+            hw_report["level3_registered_workload"] = {
+                "status": "FAILED_CHECKPOINT_HASH",
+                "reason": "Checkpoint hash mismatch; cannot execute unverified model artifact.",
+            }
+        elif ckpt_status != "PASSED":
+            hw_report["level3_registered_workload"] = {
+                "status": "BLOCKED_WORKLOAD_UNVERIFIED",
+                "reason": "Approved checkpoint is missing or unverified; real model execution cannot proceed.",
+            }
+        else:
+            # Attempt execution of actual registered TabICLv2 configuration
+            try:
+                from tabicl import TabICLRegressor
+            except ImportError as e:
+                hw_report["level3_registered_workload"] = {
+                    "status": "BLOCKED_WORKLOAD_UNVERIFIED",
+                    "reason": f"TabICL package not installed: {e}",
+                }
+            else:
+                max_allowed_mb = float(workload_config.get("max_memory_mb", 11000.0))
+                try:
+                    tabicl_mod = sys.modules.get("tabicl")
+                    is_mock = bool(
+                        getattr(TabICLRegressor, "_is_mock", False) is True
+                        or (getattr(tabicl_mod, "_is_mock", False) is True)
+                        or (tabicl_mod is not None and type(tabicl_mod).__name__ in ("MagicMock", "Mock"))
+                        or type(TabICLRegressor).__name__ in ("MagicMock", "Mock")
+                        or getattr(TabICLRegressor, "__name__", "").startswith("Mock")
+                    )
+
+                    context_size = int(workload_config.get("context_size", 1000))
+                    n_features = int(workload_config.get("n_features", 20))
+                    n_estimators = int(workload_config.get("n_estimators", 10))
+
+                    rng_wl = np.random.default_rng(42)
+                    X_train_wl = rng_wl.normal(size=(context_size, n_features))
+                    y_train_wl = rng_wl.normal(size=context_size)
+                    X_eval_wl = rng_wl.normal(size=(min(100, context_size), n_features))
+
+                    torch.cuda.reset_peak_memory_stats(0)
+
+                    # Initialize model and link checkpoint
+                    init_kwargs = {"n_estimators": n_estimators, "random_state": 42}
+                    import inspect
+                    sig = inspect.signature(TabICLRegressor.__init__)
+                    if "device" in sig.parameters:
+                        init_kwargs["device"] = "cuda"
+                    if "checkpoint_path" in sig.parameters and checkpoint_path is not None:
+                        init_kwargs["checkpoint_path"] = str(checkpoint_path)
+                    elif "model_path" in sig.parameters and checkpoint_path is not None:
+                        init_kwargs["model_path"] = str(checkpoint_path)
+
+                    model = TabICLRegressor(**init_kwargs)
+                    if hasattr(model, "load_checkpoint") and checkpoint_path is not None:
+                        model.load_checkpoint(str(checkpoint_path))
+
+                    loaded_ckpt_info = {
+                        "checkpoint_path": str(checkpoint_path),
+                        "checkpoint_sha256": report["components"]["Checkpoint"].get("sha256"),
+                    }
+
+                    # Fit and predict with actual model
+                    model.fit(X_train_wl, y_train_wl)
+                    Q_wl = model.predict(X_eval_wl, output_type="raw_quantiles")
+
+                    # Measure peak GPU memory from the actual model execution
+                    model_peak_mb = round(torch.cuda.max_memory_allocated(0) / (1024**2), 2)
+                    report["environment"]["peak_vram_allocated_mb"] = model_peak_mb
+
+                    # Incompatible output geometry or non-monotonic quantiles
+                    shape_ok = (isinstance(Q_wl, np.ndarray) and Q_wl.ndim == 2 and Q_wl.shape[0] == len(X_eval_wl) and Q_wl.shape[1] == 999)
+                    monotonic_ok = bool(np.isfinite(Q_wl).all() and np.all(np.diff(Q_wl, axis=1) >= 0)) if shape_ok else False
+
+                    if not shape_ok or not monotonic_ok:
+                        hw_report["level3_registered_workload"] = {
+                            "status": "FAILED_GEOMETRY_OR_ALPHA_GRID",
+                            "output_shape": list(Q_wl.shape) if hasattr(Q_wl, "shape") else None,
+                            "expected_shape": [len(X_eval_wl), 999],
+                            "monotonic": monotonic_ok,
+                            "peak_vram_allocated_mb": model_peak_mb,
+                        }
+                    elif model_peak_mb > max_allowed_mb:
+                        hw_report["level3_registered_workload"] = {
+                            "status": "FAILED_EXCEEDS_MEMORY_LIMIT",
+                            "workload_config": workload_config,
+                            "peak_vram_allocated_mb": model_peak_mb,
+                            "memory_limit_mb": max_allowed_mb,
+                            "loaded_checkpoint": loaded_ckpt_info,
+                        }
+                    else:
+                        evidence_type = "MOCK_ORCHESTRATION_ONLY" if is_mock else "REAL_EXECUTION"
+                        hw_report["level3_registered_workload"] = {
+                            "status": "PASSED",
+                            "workload_config": workload_config,
+                            "peak_vram_allocated_mb": model_peak_mb,
+                            "memory_limit_mb": max_allowed_mb,
+                            "loaded_checkpoint": loaded_ckpt_info,
+                            "output_shape": list(Q_wl.shape),
+                            "monotonic_quantiles": True,
+                            "evidence_type": evidence_type,
+                            "mocked": is_mock,
+                        }
+                except (getattr(torch.cuda, "OutOfMemoryError", MemoryError), MemoryError) as e:
+                    hw_report["level3_registered_workload"] = {
+                        "status": "FAILED_CUDA_OOM",
+                        "error": str(e),
+                        "workload_config": workload_config,
+                        "memory_limit_mb": max_allowed_mb,
+                    }
+                except Exception as e:
+                    hw_report["level3_registered_workload"] = {
+                        "status": "FAILED",
+                        "error": str(e),
+                        "workload_config": workload_config,
+                    }
 
         # Evaluate aggregated HardwareRuntime status
         hw_levels = [
@@ -351,6 +458,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, default=Path("outputs/G0/api_preflight.json"), help="Destination path for output JSON report")
     parser.add_argument("--diagnostic-only", action="store_true", help="Diagnostic-only mode (cannot produce G0 PASS)")
     parser.add_argument("--workload-config", type=Path, default=None, help="Path to registered workload configuration file (JSON/YAML)")
+    parser.add_argument("--run-workload-test", action="store_true", help="Execute Level 3 registered workload verification on GPU")
+    parser.add_argument("--no-inference-smoke", dest="run_inference_smoke", action="store_false", default=True, help="Skip Level 2 CUDA inference smoke test")
     args = parser.parse_args()
 
     workload_cfg = None
@@ -363,6 +472,8 @@ if __name__ == "__main__":
         expected_checkpoint_sha256=args.expected_sha256,
         diagnostic_only=args.diagnostic_only,
         workload_config=workload_cfg,
+        run_inference_smoke=args.run_inference_smoke,
+        run_workload_test=args.run_workload_test,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -370,3 +481,10 @@ if __name__ == "__main__":
         json.dump(result, f, indent=2)
 
     print(json.dumps(result, indent=2))
+
+    if result["status"] == "ALL_PROBES_PASSED":
+        sys.exit(0)
+    elif "FAIL" in result["status"]:
+        sys.exit(1)
+    else:
+        sys.exit(2)

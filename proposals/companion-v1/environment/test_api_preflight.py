@@ -56,6 +56,31 @@ class MockTabICLRegressorMissingAlphas:
         return np.zeros((len(X), 999))
 
 
+class MockTabICLRegressorOOM:
+    def __init__(self, *args, **kwargs):
+        self.alphas_ = np.linspace(0.001, 0.999, 999)
+
+    def fit(self, X, y):
+        return self
+
+    def predict(self, X, output_type=None):
+        raise MockTorchValid.cuda.OutOfMemoryError("CUDA out of memory on registered workload")
+
+
+class MockTabICLRegressorNonMonotonic:
+    def __init__(self, *args, **kwargs):
+        self.alphas_ = np.linspace(0.001, 0.999, 999)
+
+    def fit(self, X, y):
+        return self
+
+    def predict(self, X, output_type=None):
+        n = len(X)
+        # Inverted ordering violates monotonicity
+        base = np.linspace(5.0, -5.0, 999)
+        return np.tile(base, (n, 1))
+
+
 class MockTabICLClassifierValid:
     def __init__(self, *args, **kwargs):
         self.classes_ = np.array([0, 1])
@@ -112,6 +137,9 @@ class MockTorchValid:
         cuda = "12.1"
 
     class cuda:
+        class OutOfMemoryError(Exception):
+            pass
+
         @staticmethod
         def is_available():
             return True
@@ -325,3 +353,130 @@ def test_diagnostic_only_mode_cannot_pass(mock_all_dependencies, sample_checkpoi
     )
     assert report["status"] == "DIAGNOSTIC_ONLY_PREFLIGHT_BLOCKED"
     assert report["status"] != "ALL_PROBES_PASSED"
+
+
+def test_level3_gpu_oom_results_in_failed_cuda_oom(mock_all_dependencies, monkeypatch, sample_checkpoint_file):
+    ckpt_path, expected_sha = sample_checkpoint_file
+    workload_cfg = {"n_estimators": 10, "context_size": 1000, "max_memory_mb": 11000.0}
+
+    # Patch TabICLRegressor to raise CUDA OutOfMemoryError
+    tabicl_mock = sys.modules["tabicl"]
+    tabicl_mock.TabICLRegressor = MockTabICLRegressorOOM
+
+    report = probe_api_compatibility(
+        checkpoint_path=ckpt_path,
+        expected_checkpoint_sha256=expected_sha,
+        workload_config=workload_cfg,
+        run_inference_smoke=True,
+        run_workload_test=True,
+    )
+    assert report["components"]["HardwareRuntime"]["level3_registered_workload"]["status"] == "FAILED_CUDA_OOM"
+    assert report["components"]["HardwareRuntime"]["status"] == "FAILED_HARDWARE_RUNTIME"
+    assert report["status"] == "PROBES_FAILED"
+
+
+def test_level3_exceeds_memory_limit_results_in_failed(mock_all_dependencies, monkeypatch, sample_checkpoint_file):
+    ckpt_path, expected_sha = sample_checkpoint_file
+    workload_cfg = {"n_estimators": 10, "context_size": 1000, "max_memory_mb": 1000.0}
+
+    # MockTorchValid reports 2048 MB peak memory, which exceeds 1000 MB limit
+    report = probe_api_compatibility(
+        checkpoint_path=ckpt_path,
+        expected_checkpoint_sha256=expected_sha,
+        workload_config=workload_cfg,
+        run_inference_smoke=True,
+        run_workload_test=True,
+    )
+    assert report["components"]["HardwareRuntime"]["level3_registered_workload"]["status"] == "FAILED_EXCEEDS_MEMORY_LIMIT"
+    assert report["components"]["HardwareRuntime"]["status"] == "FAILED_HARDWARE_RUNTIME"
+    assert report["status"] == "PROBES_FAILED"
+
+
+def test_level3_incompatible_geometry_results_in_failed(mock_all_dependencies, monkeypatch, sample_checkpoint_file):
+    ckpt_path, expected_sha = sample_checkpoint_file
+    workload_cfg = {"n_estimators": 10, "context_size": 1000, "max_memory_mb": 11000.0}
+
+    # Non-monotonic predictions in registered workload
+    tabicl_mock = sys.modules["tabicl"]
+    tabicl_mock.TabICLRegressor = MockTabICLRegressorNonMonotonic
+
+    report = probe_api_compatibility(
+        checkpoint_path=ckpt_path,
+        expected_checkpoint_sha256=expected_sha,
+        workload_config=workload_cfg,
+        run_inference_smoke=True,
+        run_workload_test=True,
+    )
+    assert report["components"]["HardwareRuntime"]["level3_registered_workload"]["status"] == "FAILED_GEOMETRY_OR_ALPHA_GRID"
+    assert report["components"]["HardwareRuntime"]["status"] == "FAILED_HARDWARE_RUNTIME"
+    assert report["status"] == "PROBES_FAILED"
+
+
+def test_level3_checkpoint_identity_and_mock_labeling(mock_all_dependencies, sample_checkpoint_file):
+    ckpt_path, expected_sha = sample_checkpoint_file
+    workload_cfg = {"n_estimators": 10, "context_size": 1000, "max_memory_mb": 11000.0}
+
+    report = probe_api_compatibility(
+        checkpoint_path=ckpt_path,
+        expected_checkpoint_sha256=expected_sha,
+        workload_config=workload_cfg,
+        run_inference_smoke=True,
+        run_workload_test=True,
+    )
+    lvl3 = report["components"]["HardwareRuntime"]["level3_registered_workload"]
+    assert lvl3["status"] == "PASSED"
+    # Checkpoint identity is linked to loaded artifact
+    assert lvl3["loaded_checkpoint"]["checkpoint_path"] == str(ckpt_path)
+    assert lvl3["loaded_checkpoint"]["checkpoint_sha256"] == expected_sha
+    # Mocked model can validate orchestration but cannot constitute real G0 execution evidence
+    assert lvl3["mocked"] is True
+    assert lvl3["evidence_type"] == "MOCK_ORCHESTRATION_ONLY"
+
+
+def test_level2_verifies_basic_cuda_smoke_only(mock_all_dependencies, sample_checkpoint_file):
+    ckpt_path, expected_sha = sample_checkpoint_file
+    report = probe_api_compatibility(
+        checkpoint_path=ckpt_path,
+        expected_checkpoint_sha256=expected_sha,
+        run_inference_smoke=True,
+        run_workload_test=False,
+    )
+    lvl2 = report["components"]["HardwareRuntime"]["level2_synthetic_smoke"]
+    assert lvl2["status"] == "PASSED"
+    assert lvl2["cuda_functional"] is True
+    # Level 2 does not claim registered workload feasibility
+    assert report["components"]["HardwareRuntime"]["level3_registered_workload"]["status"] == "BLOCKED_WORKLOAD_UNVERIFIED"
+
+
+def test_cli_flags_and_truthful_exit_codes(sample_checkpoint_file, tmp_path):
+    import subprocess
+    ckpt_path, expected_sha = sample_checkpoint_file
+    out_json = tmp_path / "preflight_cli_out.json"
+
+    # 1. Diagnostic only -> Exit code 2 (BLOCKED)
+    res_diag = subprocess.run(
+        [sys.executable, str(Path("proposals/companion-v1/environment/api_preflight.py")), "--diagnostic-only", "--output", str(out_json)],
+        capture_output=True,
+        text=True,
+    )
+    assert res_diag.returncode == 2
+
+    # 2. Checkpoint mismatch -> Exit code 1 (FAILED)
+    res_fail = subprocess.run(
+        [sys.executable, str(Path("proposals/companion-v1/environment/api_preflight.py")), "--checkpoint", str(ckpt_path), "--expected-sha256", "wrong_hash", "--output", str(out_json)],
+        capture_output=True,
+        text=True,
+    )
+    assert res_fail.returncode == 1
+
+    # 3. CLI accepts --run-workload-test and --workload-config
+    wl_json = tmp_path / "workload.json"
+    wl_json.write_text('{"context_size": 50, "n_features": 5, "max_memory_mb": 5000.0}', encoding="utf-8")
+    res_wl = subprocess.run(
+        [sys.executable, str(Path("proposals/companion-v1/environment/api_preflight.py")), "--workload-config", str(wl_json), "--run-workload-test", "--output", str(out_json)],
+        capture_output=True,
+        text=True,
+    )
+    # Exits with 2 because unapproved dependencies/checkpoint are blocked in clean environment
+    assert res_wl.returncode == 2
+    assert out_json.exists()

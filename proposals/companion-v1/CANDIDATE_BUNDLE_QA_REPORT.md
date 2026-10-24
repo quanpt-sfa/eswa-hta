@@ -3,23 +3,25 @@
 
 **Document:** `proposals/companion-v1/CANDIDATE_BUNDLE_QA_REPORT.md`  
 **Date:** 2026-10-24  
-**Author:** Coding & QA Agent (G0 Remediation & Acceptance Strengthening)  
-**Working Branch:** `fix/g0-final-preflight-and-fold-isolation`  
-**Base Commit:** `0c99093a26c2ebc663d56d55ea62aeb2e4d5f110`  
+**Author:** Coding & QA Agent (Repair Confirmed Implementation Defects)  
+**Working Branch:** `fix/candidate-code-defects-and-workload-verification`  
+**Base Commit:** `fcbcf5f1f5532d8d53f5f4d0e0bda408a48b9b98`  
 **Target Proposal:** `proposals/companion-v1/` and `proposals/human-staging/`  
-**Status:** `CANDIDATE_QA_PASSED_PENDING_EXTERNAL_APPROVAL` (64/64 Unit & Adversarial Tests PASSED; G0 Preflight STOP_BLOCKER)
+**Status:** `CANDIDATE_QA_PASSED_PENDING_EXTERNAL_APPROVAL` (70/70 Unit & Adversarial Tests PASSED; G0 Preflight STOP_BLOCKER)
 
 ---
 
 ## 1. Test Suite Summary (Executed Full Suite)
 
-- **Previous Baseline:** 42 passed
-- **New Tests Added:** 22 passed
-  - `test_api_preflight.py`: +10 tests
-  - `test_hta_ref.py`: +2 tests (covering 19 distinct regression assertions)
-  - `test_staging.py`: +10 tests (covering 12 adversarial staging requirements)
-- **Final Collected Tests:** 64
-- **Passed:** 64
+- **Previous Baseline:** 64 passed
+- **New Tests / Assertions Added:** +6 tests (+22 assertions)
+  - `test_api_preflight.py`: +6 tests (now 16 passed, covering GPU OOM, memory limits, geometry validation, checkpoint linkage, mock labeling, and CLI exit codes)
+  - `test_hta_ref.py`: 26 passed (+4 regression assertion groups covering Defect B: `fixed_assets_pre`, `dividend_pre`, `debt_pre`, outcome features, and fail-closed cutoffs)
+  - `test_staging.py`: 20 passed
+  - `test_protocol_contract.py`: 3 passed
+  - `test_fixture_schema.py`: 5 passed
+- **Final Collected Tests:** 70
+- **Passed:** 70
 - **Failed:** 0
 - **Skipped:** 0
 - **Overall Exit Code:** 0
@@ -138,3 +140,31 @@ python -m pytest proposals/ -v
 4. **Defect 4 (Master Dataset Protection in Human Staging):**
    - Root cause: Path validation checked output collisions among themselves but omitted checking against `--master`, risking accidental source overwrite.
    - Resolution: Validated all paths against master, prohibited vault inside release folders, implemented atomic temp writes with rollback, and added 10 adversarial tests verifying master SHA-256 remains byte-identical.
+
+---
+
+## 4. Confirmed Implementation Defect Repairs (Defect A & Defect B)
+
+1. **Defect A: Incorrect registered-workload GPU verification (`api_preflight.py`):**
+   - **Original defect:** Level 3 evaluated memory feasibility using peak memory measured from a trivial 20x5 PyTorch tensor operation (`t_dummy = torch.randn((20, 5))`) executed during Level 2, rather than executing the actual registered TabICLv2 configuration or measuring real model peak memory. Missing CLI execution flags prevented driving the registered workload verification path.
+   - **Corrected implementation:**
+     - Level 2 strictly verifies basic CUDA functionality and compute readiness only.
+     - Level 3 requires execution of the actual registered TabICLv2 configuration (`context_size`, `n_features`, `n_estimators`, `fit`, and `predict` with `output_type="raw_quantiles"`).
+     - GPU peak memory is measured directly from the model execution using `torch.cuda.max_memory_allocated(0)` following `reset_peak_memory_stats(0)`.
+     - Checkpoint identity (`checkpoint_path` and verified SHA-256) is recorded and linked to the loaded model.
+     - Missing dependencies or unverified checkpoints report `BLOCKED_WORKLOAD_UNVERIFIED`.
+     - CUDA OOM (`FAILED_CUDA_OOM`), geometry/alpha monotonicity violations (`FAILED_GEOMETRY_OR_ALPHA_GRID`), memory limit exceedance (`FAILED_EXCEEDS_MEMORY_LIMIT`), and checkpoint checksum mismatches (`FAILED_CHECKPOINT_HASH`) fail closed to `PROBES_FAILED`.
+     - Mocked model executions validate orchestration but are explicitly tagged with `evidence_type: "MOCK_ORCHESTRATION_ONLY"` and `mocked: True`, preventing mock results from being misrepresented as real G0 GPU evidence.
+     - CLI arguments `--run-workload-test`, `--no-inference-smoke`, and truthful exit codes (0 for PASS, 1 for FAIL, 2 for BLOCKED) enable automated execution and gate verification.
+   - **Regression tests:** Added 6 new unit tests in `test_api_preflight.py` covering GPU OOM, memory limits, output geometry/monotonicity, checkpoint linkage, mock tagging, and CLI exit codes.
+
+2. **Defect B: Incorrect source-column substring validation (`hta_ref.py:verify_feature_provenance`):**
+   - **Original defect:** `verify_feature_provenance()` included `"d"` as a forbidden substring in `forbidden_sources = ["pat_post", "fs_aud", "audit_adj", "delta", "d", "y_k", "lnst_sau_kiem_toan"]`. Because `"d" in sc` evaluated as a character substring check, legitimate pre-audit financial predictors containing the letter 'd' (e.g. `fixed_assets_pre`, `dividend_pre`, `debt_pre`, `depreciation_pre`, `rnd_pre`) were falsely rejected with `FAILED_LEAKAGE_AUDITED_INPUT`.
+   - **Corrected implementation:**
+     - Replaced substring matching with controlled semantic token classification: exact forbidden tokens (`forbidden_exact_sources = {"d", "delta", "pat_post", "is_zero_adj", ...}`), controlled prefixes (`"fs_aud_", "audit_adj_", "audit_adjustment_", "post_audit_", "delta_", "d_"`), and controlled suffixes (`"_post", "_aud", "_audited"`).
+     - Ensured legitimate pre-audit predictors (`fixed_assets_pre`, `dividend_pre`, `debt_pre`) are recognized as safe and return `PASSED`.
+     - Ensured declared metadata alone cannot certify an outcome variable: features matching outcome names/prefixes/suffixes fail closed regardless of declared metadata unless approved as historical lags.
+     - Enforced that missing or unparseable prediction cutoffs fail closed (`BLOCKED_INVALID_CUTOFF`), and publication dates after cutoff fail with `FAILED_TEMPORAL_LEAKAGE`.
+     - Strictly verified $c_{k050}$ lineage: requires `temporal_status: "t_pre"`, approved pre-audit sources (`pat_pre`, `total_assets_pre`), and verified pre-audit formula.
+   - **Regression tests:** Added 4 regression assertion suites in `test_hta_ref.py` explicitly asserting that `fixed_assets_pre`, `dividend_pre`, `debt_pre` pass, outcome variables fail closed, missing cutoffs fail closed, and $c_{k075}$ is rejected.
+
