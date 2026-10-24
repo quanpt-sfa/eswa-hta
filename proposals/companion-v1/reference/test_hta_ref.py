@@ -293,3 +293,32 @@ def test_crps_score():
     crps = hta_ref.crps_score(y_true, Q, alphas)
     assert crps > 0.0, "CRPS must be positive"
     assert math.isfinite(crps)
+
+
+# Independent audit regression tests: the initial candidate did not cover ties,
+# missing publication timestamps, or degenerate near-zero quintiles.
+
+def test_average_precision_ties_invariant_to_row_order():
+    # For tied scores, both observations form one PR step: AP = prevalence = 1/2.
+    scores = np.array([0.5, 0.5])
+    assert hta_ref.compute_average_precision([1, 0], scores) == pytest.approx(0.5)
+    assert hta_ref.compute_average_precision([0, 1], scores) == pytest.approx(0.5)
+
+
+def test_unknown_publication_date_is_not_safe():
+    flags = hta_ref.check_feature_leakage(
+        ["2020-03-01", None, "2020-05-01", "2020-01-01"],
+        ["2020-04-01", "2020-04-01", None, "2020-02-01"],
+    )
+    assert list(flags) == [False, True, True, False]
+    d = pd.DataFrame({
+        "source_date": [None, "2020-04-05"],
+        "cutoff": ["2020-04-01", "2020-04-01"],
+    })
+    assert list(hta_ref.check_point_in_time(d, ["source_date"], "cutoff")["leakage_source_date"]) == [True, True]
+
+
+def test_near_zero_quintiles_reject_duplicated_edges():
+    df = pd.DataFrame({"q": [0.01] * 25, "eligible_model": [True] * 25})
+    with pytest.raises(ValueError, match="tied"):
+        hta_ref.near_zero_bins(df)
