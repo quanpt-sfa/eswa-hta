@@ -142,42 +142,50 @@ gates:
     approval_owner: "Human Research Lead"
 
   G5:
-    name: "Model Training on Development Folds (Baselines B1-B5)"
+    name: "Pilot Baselines B1, B3a, B3b, B4, B6 (Development Only)"
     requires_approvals: ["gates/G4_APPROVED.txt"]
     input_files:
       - path: "data/processed/features_X2.parquet"
-      - path: "data/processed/dev_splits.json"
+      - path: "outputs/G4/folds.csv"
+      - path: "config/protocol.yaml"
     expected_outputs:
-      - path: "outputs/G5/predictions_val_folds_baselines.parquet"
-      - path: "outputs/G5/validation_metrics_baselines.csv"
+      - path: "outputs/G5/predictions_B1.parquet"
+      - path: "outputs/G5/predictions_B3a.parquet"
+      - path: "outputs/G5/predictions_B3b.parquet"
+      - path: "outputs/G5/predictions_B4.parquet"
+      - path: "outputs/G5/predictions_B6.parquet"
       - path: "gates/G5_QA_report.md"
-    primary_key: ["firm_id", "fiscal_year", "model_id"]
-    row_scope: "Validation fold firm-years (2019-2022)"
+    primary_key: ["row_id", "model_id", "fold", "k"]
+    row_scope: "Development validation years 2019-2022 ONLY"
     qa_command: "pytest -q tests/test_g5.py"
     expected_exit_code: 0
     stop_conditions:
-      - "Training on validation years"
-      - "MultiQuantile shape mismatch"
+      - "Missing any of the five registered pilot models"
+      - "Any test-year outcome used during training or model selection"
+      - "Unverified quantile grid or invalid prediction probabilities"
     unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
     approval_owner: "Human Research Lead"
 
   G6:
-    name: "Pilot Decision Gate: M0/M1 Feasibility and Non-Inferiority"
+    name: "Distributional Pilot GO/NO-GO (Based on B6; M1 not trained yet)"
     requires_approvals: ["gates/G5_APPROVED.txt"]
     input_files:
-      - path: "outputs/G5/predictions_val_folds_baselines.parquet"
-      - path: "outputs/G6/predictions_val_folds_tabicl.parquet"
+      - path: "outputs/G5/predictions_B3a.parquet"
+      - path: "outputs/G5/predictions_B3b.parquet"
+      - path: "outputs/G5/predictions_B4.parquet"
+      - path: "outputs/G5/predictions_B6.parquet"
       - path: "config/protocol.yaml"
     expected_outputs:
-      - path: "outputs/G6/pilot_decision_report.md"
+      - path: "outputs/G6/pilot_go_no_go.json"
       - path: "gates/G6_QA_report.md"
     primary_key: null
-    row_scope: "Development folds pooled (2019-2022)"
+    row_scope: "Pooled 2019-2022 OOF predictions (development only)"
     qa_command: "pytest -q tests/test_g6.py"
     expected_exit_code: 0
     stop_conditions:
-      - "M1 performance falls in NO-GO zone without protocol amendment"
-      - "Evaluation on test set prior to G10"
+      - "Pilot margins lack human approval"
+      - "NO-GO/grey zone bypassed without human decision"
+      - "Any final-test-derived decision"
     unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
     approval_owner: "Human Research Lead"
 
@@ -214,44 +222,56 @@ gates:
     approval_owner: "Human Research Lead"
 
   G9:
-    name: "Full Model Lock and Test Feature Ingestion"
+    name: "Complete B1-B8 and E1-E5 Development Experiments (Not Final Test)"
     requires_approvals: ["gates/G7_APPROVED.txt"]
     input_files:
-      - path: "data/source/test_features_candidate.parquet"
       - path: "data/processed/features_X2.parquet"
+      - path: "outputs/G4/folds.csv"
+      - path: "outputs/G5/predictions_B6.parquet"
+      - path: "outputs/G7/predictions_val_folds_hurdle.parquet"
     expected_outputs:
-      - path: "outputs/G9/frozen_models_lock.sha256"
-      - path: "outputs/G9/test_predictions_blinded.parquet"
+      - path: "outputs/G9/E1_distributional_comparison.csv"
+      - path: "outputs/G9/E2_hurdle_ablation.csv"
+      - path: "outputs/G9/E3_threshold_comparison.csv"
+      - path: "outputs/G9/E4_threshold_transfer.csv"
+      - path: "outputs/G9/E5_near_zero_subgroups.csv"
       - path: "gates/G9_QA_report.md"
-    primary_key: ["firm_id", "fiscal_year", "model_id"]
-    row_scope: "Candidate test years 2023-2025 (features only)"
+    primary_key: null
+    row_scope: "Development out-of-fold 2019-2022; no FY2023-2025 outcomes or test scores"
     qa_command: "pytest -q tests/test_g9.py"
     expected_exit_code: 0
     stop_conditions:
-      - "test_features_candidate contains post-audit outcome columns"
-      - "Model retrained after lock is generated"
+      - "B2/B5 or required model ablations missing"
+      - "Any experimental adjustment using protected final-test information"
     unlock_policy: "PROTECTED_OUTCOMES_STRICTLY_FORBIDDEN"
     approval_owner: "Human Research Lead"
 
   G10:
-    name: "Test Outcome Unlock and Primary Hypothesis Evaluation"
-    requires_approvals: ["gates/G9_APPROVED.txt", "data/locked/HUMAN_UNLOCK_G10.txt"]
+    name: "Freeze Models, Predict Blinded Test Candidates, Then Human Unlock for Evaluation"
+    requires_approvals: ["gates/G9_APPROVED.txt"]
     input_files:
+      - path: "data/source/test_features_candidate.parquet"
+      - path: "config/protocol.yaml"
       - path: "data/locked/test_outcomes.parquet"
-      - path: "outputs/G9/test_predictions_blinded.parquet"
-      - path: "outputs/G9/frozen_models_lock.sha256"
+        access_class: "HUMAN_UNSEALED_ONLY_AFTER_MODEL_AND_PREDICTION_LOCK"
+      - path: "data/locked/HUMAN_UNLOCK_G10.txt"
+        access_class: "HUMAN_ONLY_AFTER_MODEL_LOCK"
     expected_outputs:
-      - path: "outputs/G10/primary_endpoint_table.csv"
-      - path: "outputs/G10/paired_bootstrap_results.json"
+      - path: "outputs/G10/final_model_lock.json"
+      - path: "outputs/G10/final_test_predictions.parquet"
+      - path: "outputs/G10/primary_metric_results.csv"
+      - path: "outputs/G10/paired_bootstrap_results.csv"
       - path: "gates/G10_QA_report.md"
-    primary_key: ["firm_id", "fiscal_year"]
-    row_scope: "Final test years 2023-2025"
+    primary_key: ["row_id", "model_id", "fold", "k"]
+    row_scope: "Prediction first on FY2023-2025 pre-audit candidates; join sealed labels only AFTER human unlock"
     qa_command: "pytest -q tests/test_g10.py"
     expected_exit_code: 0
     stop_conditions:
-      - "HUMAN_UNLOCK_G10.txt absent"
-      - "Frozen model checksum mismatch"
-    unlock_policy: "TEST_OUTCOMES_AUTHORIZED"
+      - "Primary model or comparator not locked from development"
+      - "Human unlock missing or checksum does not match frozen model lock"
+      - "Test outcomes readable before all test predictions are frozen"
+      - "Post-audit label used for prediction-row selection"
+    unlock_policy: "TWO_PHASE_HUMAN_UNLOCK_AFTER_LOCKED_PREDICTIONS"
     approval_owner: "Human Research Lead"
 
   G11:
