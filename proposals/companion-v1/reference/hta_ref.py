@@ -495,7 +495,9 @@ def paired_firm_cluster_bootstrap(
         mb = metric_fn(y_boot, s_b[boot_indices])
         diffs[b] = ma - mb
 
-    valid_diffs = diffs[~np.isnan(diffs)]
+    valid_diffs = diffs[np.isfinite(diffs)]
+    if len(valid_diffs) < 2:
+        raise ValueError("Insufficient valid firm-cluster bootstrap replications")
     ci_lower = float(np.percentile(valid_diffs, 100 * (alpha / 2)))
     ci_upper = float(np.percentile(valid_diffs, 100 * (1 - alpha / 2)))
 
@@ -524,11 +526,14 @@ def near_zero_bins(
     Computes quintiles of q = |PAT_pre| / assets on development eligible_model
     rows with fixed edges, returning assigned bin IDs [0..n_bins-1] and edges.
     """
-    eligible_mask = df[eligible_col].astype(bool)
+    eligible_mask = df[eligible_col].fillna(False).astype(bool)
     dev_q = df.loc[eligible_mask, q_col].dropna()
-
+    if n_bins < 2 or dev_q.empty or not np.isfinite(dev_q.to_numpy(dtype=float)).all():
+        raise ValueError("Near-zero bins need finite, nonempty development data and n_bins >= 2")
     quantiles = np.linspace(0, 1, n_bins + 1)
     bin_edges = np.percentile(dev_q, quantiles * 100)
+    if np.any(np.diff(bin_edges) <= 0):
+        raise ValueError("Quantile bin edges are tied; request a pre-registered binning fallback")
     bin_edges[0] = -np.inf
     bin_edges[-1] = np.inf
 
@@ -541,25 +546,24 @@ def near_zero_bins(
 # ==============================================================================
 
 def compute_average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Computes exact Average Precision (area under PR curve)."""
+    """Average Precision with score-tie handling identical to sklearn.
+
+    All examples with identical prediction scores form one precision-recall
+    step; arbitrary row order must not affect the result.
+    """
+    from sklearn.metrics import average_precision_score
+
     y_true = np.asarray(y_true, dtype=int)
     y_score = np.asarray(y_score, dtype=float)
-
-    if len(np.unique(y_true)) < 2:
-        return np.nan
-
-    order = np.argsort(-y_score)
-    y_ordered = y_true[order]
-    
-    tp = np.cumsum(y_ordered == 1)
-    fp = np.cumsum(y_ordered == 0)
-    recalls = tp / np.sum(y_true == 1)
-    precisions = tp / (tp + fp)
-
-    # Average precision definition: sum (R_k - R_{k-1}) * P_k
-    r_prev = np.concatenate(([0.0], recalls[:-1]))
-    ap = float(np.sum((recalls - r_prev) * precisions))
-    return ap
+    if y_true.ndim != 1 or y_score.ndim != 1 or len(y_true) != len(y_score):
+        raise ValueError("y_true and y_score must be one-dimensional with equal length")
+    if not len(y_true) or not np.isfinite(y_score).all():
+        raise ValueError("AP requires nonempty finite score arrays")
+    if not np.isin(y_true, [0, 1]).all():
+        raise ValueError("AP requires binary 0/1 labels")
+    if np.unique(y_true).size < 2:
+        return float("nan")
+    return float(average_precision_score(y_true, y_score))
 
 
 def compute_brier_score(y_true: np.ndarray, y_prob: np.ndarray) -> float:
@@ -608,16 +612,13 @@ def check_feature_leakage(
     feature_pub_dates: Sequence[Union[str, pd.Timestamp]],
     prediction_cutoffs: Sequence[Union[str, pd.Timestamp]]
 ) -> pd.Series:
-    """
-    Checks that every feature's release date is not later than the prediction cutoff.
-    Returns boolean Series where True indicates a LEAKAGE violation.
-    """
-    f_dates = pd.to_datetime(feature_pub_dates)
-    cutoffs = pd.to_datetime(prediction_cutoffs)
-
-    # Violation if feature publication is strictly after prediction timestamp
-    leakage_flag = f_dates > cutoffs
-    return pd.Series(leakage_flag, name="leakage")
+    """Fail closed: missing/invalid timestamps are unverified, not safe."""
+    f_dates = pd.to_datetime(feature_pub_dates, errors="coerce", utc=True)
+    cutoffs = pd.to_datetime(prediction_cutoffs, errors="coerce", utc=True)
+    if len(f_dates) != len(cutoffs):
+        raise ValueError("Publication dates and cutoffs must have equal length")
+    flags = f_dates.isna() | cutoffs.isna() | (f_dates > cutoffs)
+    return pd.Series(np.asarray(flags, dtype=bool), name="leakage")
 
 
 def check_point_in_time(
@@ -625,12 +626,12 @@ def check_point_in_time(
     date_cols: Sequence[str],
     cutoff_col: str
 ) -> pd.DataFrame:
-    """Audits multiple date columns against cutoff; returns violation flags."""
+    """Return True for an unavailable, missing, or future-dated feature."""
     res = pd.DataFrame(index=df.index)
-    cutoff = pd.to_datetime(df[cutoff_col])
+    cutoff = pd.to_datetime(df[cutoff_col], errors="coerce", utc=True)
     for col in date_cols:
-        d_val = pd.to_datetime(df[col])
-        res[f"leakage_{col}"] = d_val > cutoff
+        date = pd.to_datetime(df[col], errors="coerce", utc=True)
+        res[f"leakage_{col}"] = date.isna() | cutoff.isna() | (date > cutoff)
     return res
 
 
