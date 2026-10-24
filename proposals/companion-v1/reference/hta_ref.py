@@ -16,9 +16,9 @@ research pipeline, including:
   7. Multi-threshold expansion (expand_thresholds / threshold_expansion)
   8. Expanding-window temporal folds (temporal_expanding_folds)
   9. Paired firm-cluster bootstrap (paired_cluster_bootstrap / paired_firm_cluster_bootstrap)
- 10. Near-zero earnings binning (near_zero_edges, assign_bins, near_zero_bins)
+ 10. Near-zero earnings binning (near_zero_edges, assign_bins, near_zero_bins, fit_fold_near_zero_bins, fit_final_near_zero_bins)
  11. Prediction evaluation metrics (ap, compute_average_precision, compute_brier_score, compute_ece, precision_recall_at_k, evaluate_predictions)
- 12. Feature leakage and point-in-time guards (check_feature_leakage, check_point_in_time, scan_feature_names, numeric_leak_check)
+ 12. Feature leakage and point-in-time guards (check_feature_leakage, check_point_in_time, scan_feature_names, verify_feature_provenance, numeric_leak_check)
  13. Fold integrity validation (assert_fold_integrity)
  14. Target transformations (target_transform, inverse_target_transform)
  15. Distributional loss and CRPS (crps_from_quantiles / crps_score, pinball_loss)
@@ -29,7 +29,7 @@ the authoritative production location `reference/hta_ref.py`.
 """
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -874,6 +874,56 @@ def near_zero_bins(
     return bin_ids, edges
 
 
+def fit_fold_near_zero_bins(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    q_col: str = "q",
+    n_bins: int = 5,
+    eligible_col: str = "eligible_model"
+) -> Tuple[pd.Series, pd.Series, np.ndarray]:
+    """
+    Fits quantile bin edges strictly on the training fold eligible observations
+    and assigns near-zero bins to both train and validation folds (§2 D22, §5 G4).
+
+    Strict Fold Isolation: Validation rows are completely excluded during edge fitting.
+    edges_f = near_zero_edges(q_train_eligible)
+    bins_train = assign_bins(q_train, edges_f)
+    bins_val = assign_bins(q_val, edges_f)
+    """
+    eligible_mask = train_df[eligible_col].fillna(False).astype(bool)
+    train_q = train_df.loc[eligible_mask, q_col].dropna()
+    edges = near_zero_edges(train_q, n_bins=n_bins)
+    bins_train = assign_bins(train_df[q_col], edges)
+    bins_val = assign_bins(val_df[q_col], edges)
+    return bins_train, bins_val, edges
+
+
+def fit_final_near_zero_bins(
+    dev_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    q_col: str = "q",
+    n_bins: int = 5,
+    eligible_col: str = "eligible_model",
+    dev_max_year: int = 2022
+) -> Tuple[pd.Series, pd.Series, np.ndarray]:
+    """
+    Fits final near-zero bin edges exclusively on authorized development years
+    (fiscal_year <= dev_max_year, e.g. 2015-2022) and applies frozen edges to
+    final test data (e.g. 2023-2025).
+
+    Strict Test Isolation: Test distributions are never used for fitting or edge adjustments.
+    """
+    dev_rows = dev_df.copy()
+    if "fiscal_year" in dev_rows.columns:
+        dev_rows = dev_rows[dev_rows["fiscal_year"] <= dev_max_year]
+    eligible_mask = dev_rows[eligible_col].fillna(False).astype(bool)
+    dev_q = dev_rows.loc[eligible_mask, q_col].dropna()
+    edges = near_zero_edges(dev_q, n_bins=n_bins)
+    bins_dev = assign_bins(dev_df[q_col], edges)
+    bins_test = assign_bins(test_df[q_col], edges)
+    return bins_dev, bins_test, edges
+
+
 # ==============================================================================
 # 11. Prediction Evaluation Metrics (§2 D20, D23, §9.1)
 # ==============================================================================
@@ -1022,13 +1072,16 @@ def check_point_in_time(
 
 def scan_feature_names(
     feature_names: Sequence[str],
-    allow: Optional[Sequence[str]] = None
+    allow: Optional[Sequence[str]] = None,
+    allow_registered_x2_predictors: bool = True
 ) -> List[str]:
     """
     Scans candidate feature column names for potential post-audit leakage (§2 D08, §5 G2).
 
     Rules:
       - Forbidden outcome variables and substrings: 'aud', 'post', 'delta', 'pat_post', 'audit_adj', 'is_zero_adj', 'eligible_'
+      - Authorized pre-audit predictor: 'c_k050' (normalized threshold 0.05 * |PAT_pre| / assets_pre) registered in X2.
+      - Other 'c_k*' variables (e.g. c_k075, c_k100) remain strictly flagged unless explicitly allowed.
       - Allowed: explicit entries in allowlist, or verified lagged variables (e.g. ending in _lag1, _lag2).
 
     Returns
@@ -1052,7 +1105,14 @@ def scan_feature_names(
         if any(c_lower.endswith(f"_lag{i}") for i in range(1, 10)):
             if c_lower in allowlist or any(allowed_pat in c_lower for allowed_pat in allowlist):
                 continue
-        # Exact forbidden outcomes
+        # c_k050 is an authorized X2 pre-audit predictor (§2 D13, §6.1)
+        if c_lower == "c_k050":
+            if allow_registered_x2_predictors:
+                continue
+            else:
+                flagged.append(col)
+                continue
+        # Exact forbidden outcomes or unapproved threshold/outcome prefixes
         if c_lower in forbidden_exact or c_lower.startswith("y_k") or c_lower.startswith("c_k"):
             flagged.append(col)
             continue
@@ -1062,6 +1122,110 @@ def scan_feature_names(
             continue
 
     return flagged
+
+
+def verify_feature_provenance(
+    feature_name: str,
+    provenance_record: Optional[Dict[str, Any]],
+    prediction_cutoff: Optional[Union[str, pd.Timestamp]] = None
+) -> Dict[str, Any]:
+    """
+    Validates semantic feature identity, physical source columns, formula,
+    reporting scope, and point-in-time timestamp against prediction cutoff (§2 D08-D09).
+
+    A feature that passes its name scan but lacks required provenance must not
+    be treated as verified safe. Where a verified provenance registry is not
+    available, returns BLOCKED_UNRESOLVED_PROVENANCE.
+
+    Parameters
+    ----------
+    feature_name : str
+        Name of the candidate feature.
+    provenance_record : Optional[Dict[str, Any]]
+        Dictionary containing metadata:
+        - 'source_columns': List[str], physical columns used to compute feature.
+        - 'formula': str, description or mathematical formula.
+        - 'reporting_scope': str, e.g. 'pre_audit', 'unaudited_q4', 'historical_audited_lag'.
+        - 'temporal_status': str, 't_pre', 'lag', 'static'.
+        - 'publication_date': Union[str, pd.Timestamp], timestamp when data was public.
+    prediction_cutoff : Optional[Union[str, pd.Timestamp]]
+        Prediction cutoff timestamp.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary with 'status' (PASSED, FAILED_LEAKAGE_AUDITED_INPUT, FAILED_TEMPORAL_LEAKAGE,
+        BLOCKED_UNRESOLVED_PROVENANCE, BLOCKED_UNRESOLVED_TIMESTAMP) and diagnostic details.
+    """
+    if provenance_record is None or not isinstance(provenance_record, dict):
+        return {
+            "feature": feature_name,
+            "status": "BLOCKED_UNRESOLVED_PROVENANCE",
+            "reason": "Provenance registry record is missing or incomplete; unverified feature cannot be treated as safe.",
+        }
+
+    # Required fields in provenance record
+    required_fields = ["source_columns", "formula", "temporal_status"]
+    for rf in required_fields:
+        if rf not in provenance_record or provenance_record[rf] is None:
+            return {
+                "feature": feature_name,
+                "status": "BLOCKED_UNRESOLVED_PROVENANCE",
+                "reason": f"Required provenance field '{rf}' is missing or null.",
+            }
+
+    if "publication_date" not in provenance_record or provenance_record["publication_date"] is None:
+        return {
+            "feature": feature_name,
+            "status": "BLOCKED_UNRESOLVED_TIMESTAMP",
+            "reason": "Publication date is missing or null; unknown publication time is not verified safe.",
+        }
+
+    source_cols = [str(c).lower() for c in provenance_record["source_columns"]]
+    forbidden_sources = ["pat_post", "fs_aud", "audit_adj", "delta", "d", "y_k", "lnst_sau_kiem_toan"]
+
+    # 1. Check for forged feature or unauthorized audited inputs in source columns
+    for sc in source_cols:
+        if any(f in sc for f in forbidden_sources) or sc.endswith("_post") or sc.endswith("_aud"):
+            # Check if this is a verified historical lag
+            if provenance_record.get("temporal_status") == "lag" and any(sc.endswith(f"_lag{i}") for i in range(1, 10)):
+                pass  # permitted if published before cutoff
+            else:
+                return {
+                    "feature": feature_name,
+                    "status": "FAILED_LEAKAGE_AUDITED_INPUT",
+                    "reason": f"Feature '{feature_name}' derives from forbidden audited source '{sc}'.",
+                }
+
+    # 2. Check publication date vs cutoff (Point-in-Time)
+    pub_date = pd.to_datetime(provenance_record["publication_date"], errors="coerce", utc=True)
+    if pd.isna(pub_date):
+        return {
+            "feature": feature_name,
+            "status": "BLOCKED_UNRESOLVED_TIMESTAMP",
+            "reason": f"Publication date '{provenance_record['publication_date']}' is missing or unparseable; unknown publication time is not verified safe.",
+        }
+
+    if prediction_cutoff is not None:
+        cutoff = pd.to_datetime(prediction_cutoff, errors="coerce", utc=True)
+        if pd.isna(cutoff):
+            return {
+                "feature": feature_name,
+                "status": "BLOCKED_INVALID_CUTOFF",
+                "reason": f"Prediction cutoff '{prediction_cutoff}' is unparseable.",
+            }
+        if pub_date > cutoff:
+            return {
+                "feature": feature_name,
+                "status": "FAILED_TEMPORAL_LEAKAGE",
+                "reason": f"Publication date {pub_date} is after prediction cutoff {cutoff}.",
+            }
+
+    return {
+        "feature": feature_name,
+        "status": "PASSED",
+        "reason": "Feature provenance and point-in-time timestamp verified safe.",
+    }
 
 
 def numeric_leak_check(

@@ -543,3 +543,177 @@ def test_all_golden_fixtures_from_csv():
         elif test_id == "T-N01":
             p = hta_ref.scipy_exceedance(stats.norm(0, 1), c=float(case["c"]))
             assert math.isclose(float(p), float(exp["expected_prob"]), abs_tol=max(tol, 1e-10))
+
+
+def test_x2_leakage_scanner_and_provenance_contract():
+    # 1. X2 containing legitimate q, c_k050, and nz_bin passes approved name policy
+    x2_features = ["sales_growth", "leverage", "roa", "q", "c_k050", "nz_bin", "y_k050_lag1"]
+    assert hta_ref.scan_feature_names(x2_features) == []
+
+    # 2. pat_post is flagged
+    assert "pat_post" in hta_ref.scan_feature_names(["pat_post"])
+
+    # 3. fs_aud_profit is flagged
+    assert "fs_aud_profit" in hta_ref.scan_feature_names(["fs_aud_profit"])
+
+    # 4. audit_adj_revenue is flagged
+    assert "audit_adj_revenue" in hta_ref.scan_feature_names(["audit_adj_revenue"])
+
+    # 5. c_k075 is not silently whitelisted as a registered predictor in primary X2 specification
+    assert "c_k075" in hta_ref.scan_feature_names(["c_k075"])
+    assert "c_k100" in hta_ref.scan_feature_names(["c_k100"])
+
+    # 6. A forged feature called c_k050 with audited inputs fails provenance validation
+    forged_c_k050 = {
+        "source_columns": ["pat_post", "total_assets_pre"],
+        "formula": "0.05 * abs(pat_post) / total_assets_pre",
+        "reporting_scope": "pre_audit",
+        "temporal_status": "t_pre",
+        "publication_date": "2020-03-15",
+    }
+    res_forged = hta_ref.verify_feature_provenance("c_k050", forged_c_k050, prediction_cutoff="2020-03-31")
+    assert res_forged["status"] == "FAILED_LEAKAGE_AUDITED_INPUT"
+
+    # Legitimate c_k050 passes provenance validation
+    legit_c_k050 = {
+        "source_columns": ["pat_pre", "total_assets_pre"],
+        "formula": "0.05 * abs(pat_pre) / total_assets_pre",
+        "reporting_scope": "pre_audit",
+        "temporal_status": "t_pre",
+        "publication_date": "2020-03-15",
+    }
+    res_legit = hta_ref.verify_feature_provenance("c_k050", legit_c_k050, prediction_cutoff="2020-03-31")
+    assert res_legit["status"] == "PASSED"
+
+    # 7. A historical audited feature with a verified publication date before cutoff is permitted
+    hist_aud_feature = {
+        "source_columns": ["fs_aud_profit_lag1"],
+        "formula": "lag1(fs_aud_profit)",
+        "reporting_scope": "historical_audited_lag",
+        "temporal_status": "lag",
+        "publication_date": "2020-03-15",
+    }
+    res_hist_valid = hta_ref.verify_feature_provenance("fs_aud_profit_lag1", hist_aud_feature, prediction_cutoff="2020-03-31")
+    assert res_hist_valid["status"] == "PASSED"
+
+    # 8. A historical audited feature published after the cutoff is rejected
+    hist_aud_late = {
+        "source_columns": ["fs_aud_profit_lag1"],
+        "formula": "lag1(fs_aud_profit)",
+        "reporting_scope": "historical_audited_lag",
+        "temporal_status": "lag",
+        "publication_date": "2020-04-15",
+    }
+    res_hist_late = hta_ref.verify_feature_provenance("fs_aud_profit_lag1", hist_aud_late, prediction_cutoff="2020-03-31")
+    assert res_hist_late["status"] == "FAILED_TEMPORAL_LEAKAGE"
+
+    # 9. A historical feature with unknown publication time is not verified as safe
+    hist_aud_unknown = {
+        "source_columns": ["fs_aud_profit_lag1"],
+        "formula": "lag1(fs_aud_profit)",
+        "reporting_scope": "historical_audited_lag",
+        "temporal_status": "lag",
+        "publication_date": None,
+    }
+    res_unknown = hta_ref.verify_feature_provenance("fs_aud_profit_lag1", hist_aud_unknown, prediction_cutoff="2020-03-31")
+    assert res_unknown["status"] == "BLOCKED_UNRESOLVED_TIMESTAMP"
+
+
+def test_near_zero_temporal_fold_isolation_and_final_edges():
+    # Build synthetic panel from 2015 to 2025
+    rng = np.random.default_rng(12345)
+    rows = []
+    for y in range(2015, 2026):
+        # Different distribution per year
+        mean_q = 0.10 if y <= 2018 else (0.80 if y <= 2022 else 5.0)
+        for i in range(20):
+            rows.append({
+                "firm_id": f"F{i:03d}",
+                "fiscal_year": y,
+                "q": float(np.abs(rng.normal(mean_q, 0.02))),
+                "eligible_model": True,
+            })
+    df = pd.DataFrame(rows)
+
+    folds = hta_ref.temporal_expanding_folds(df, year_col="fiscal_year")
+    assert len(folds) == 4
+
+    # 1. F1 edges are determined ONLY by 2015-2018
+    train_idx1, val_idx1 = folds[0]
+    train1 = df.iloc[train_idx1]
+    val1 = df.iloc[val_idx1]
+    assert train1["fiscal_year"].max() == 2018
+    assert val1["fiscal_year"].min() == 2019 and val1["fiscal_year"].max() == 2019
+
+    bins_tr1, bins_val1, edges_f1 = hta_ref.fit_fold_near_zero_bins(train1, val1)
+
+    # 2. Changing 2019-2022 validation/future q values does NOT change F1 edges
+    df_altered = df.copy()
+    df_altered.loc[df_altered["fiscal_year"] >= 2019, "q"] = 999.0
+    train1_alt = df_altered.iloc[train_idx1]
+    val1_alt = df_altered.iloc[val_idx1]
+    _, _, edges_f1_alt = hta_ref.fit_fold_near_zero_bins(train1_alt, val1_alt)
+    np.testing.assert_allclose(edges_f1, edges_f1_alt)
+
+    # 3. F2 excludes 2020-2022 when fitting
+    train_idx2, val_idx2 = folds[1]
+    train2 = df.iloc[train_idx2]
+    val2 = df.iloc[val_idx2]
+    assert train2["fiscal_year"].max() == 2019
+    assert val2["fiscal_year"].min() == 2020 and val2["fiscal_year"].max() == 2020
+    _, _, edges_f2 = hta_ref.fit_fold_near_zero_bins(train2, val2)
+
+    df_alt2 = df.copy()
+    df_alt2.loc[df_alt2["fiscal_year"] >= 2020, "q"] = 777.0
+    _, _, edges_f2_alt = hta_ref.fit_fold_near_zero_bins(df_alt2.iloc[train_idx2], df_alt2.iloc[val_idx2])
+    np.testing.assert_allclose(edges_f2, edges_f2_alt)
+
+    # 4. F3 excludes 2021-2022
+    train_idx3, val_idx3 = folds[2]
+    train3 = df.iloc[train_idx3]
+    val3 = df.iloc[val_idx3]
+    assert train3["fiscal_year"].max() == 2020
+    assert val3["fiscal_year"].min() == 2021 and val3["fiscal_year"].max() == 2021
+    _, _, edges_f3 = hta_ref.fit_fold_near_zero_bins(train3, val3)
+
+    df_alt3 = df.copy()
+    df_alt3.loc[df_alt3["fiscal_year"] >= 2021, "q"] = 555.0
+    _, _, edges_f3_alt = hta_ref.fit_fold_near_zero_bins(df_alt3.iloc[train_idx3], df_alt3.iloc[val_idx3])
+    np.testing.assert_allclose(edges_f3, edges_f3_alt)
+
+    # 5. F4 excludes 2022
+    train_idx4, val_idx4 = folds[3]
+    train4 = df.iloc[train_idx4]
+    val4 = df.iloc[val_idx4]
+    assert train4["fiscal_year"].max() == 2021
+    assert val4["fiscal_year"].min() == 2022 and val4["fiscal_year"].max() == 2022
+    _, _, edges_f4 = hta_ref.fit_fold_near_zero_bins(train4, val4)
+
+    df_alt4 = df.copy()
+    df_alt4.loc[df_alt4["fiscal_year"] >= 2022, "q"] = 333.0
+    _, _, edges_f4_alt = hta_ref.fit_fold_near_zero_bins(df_alt4.iloc[train_idx4], df_alt4.iloc[val_idx4])
+    np.testing.assert_allclose(edges_f4, edges_f4_alt)
+
+    # 6. Validation rows use frozen training edges
+    expected_val_bins = hta_ref.assign_bins(val1["q"], edges_f1)
+    pd.testing.assert_series_equal(bins_val1, expected_val_bins)
+
+    # 7. Final edges use only 2015-2022
+    dev_df = df[df["fiscal_year"] <= 2022]
+    test_df = df[df["fiscal_year"] >= 2023]
+    bins_dev, bins_test, final_edges = hta_ref.fit_final_near_zero_bins(dev_df, test_df, dev_max_year=2022)
+
+    # 8. Changing 2023-2025 q values does NOT change final edges
+    test_df_altered = test_df.copy()
+    test_df_altered["q"] = 8888.0
+    _, _, final_edges_alt = hta_ref.fit_final_near_zero_bins(dev_df, test_df_altered, dev_max_year=2022)
+    np.testing.assert_allclose(final_edges, final_edges_alt)
+
+    # 9. No target-derived or post-audit data is used for bin fitting
+    assert "pat_post" not in dev_df.columns
+
+    # 10. Tied quantile edges fail according to registered policy rather than silently altering bin count
+    tied_q = np.array([0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05])
+    with pytest.raises(ValueError, match="Quantile bin edges are tied"):
+        hta_ref.near_zero_edges(tied_q, n_bins=5)
+

@@ -16,6 +16,7 @@ to physically split master financial statement data into:
 
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import sys
 from typing import List, Tuple
@@ -37,7 +38,7 @@ FORBIDDEN_OUTCOME_COLUMNS = [
     "y_k075",
     "y_k100",
     "y_k150",
-    "y_k200"
+    "y_k200",
 ]
 
 REQUIRED_KEYS = ["firm_id", "fiscal_year", "scope"]
@@ -96,14 +97,108 @@ def stage_holdout_data(
     dev_max_year: int = 2022,
     test_min_year: int = 2023,
     approved_test_feature_columns: List[str] = None,
+    overwrite: bool = False,
 ) -> Tuple[str, str, str]:
     """
     Executes physical holdout separation and writes verification metadata.
-    Enforces positive selection, primary-key uniqueness, fiscal-year bounds,
-    and distinct path requirements.
+    Enforces master dataset collision protection, path distinctness,
+    protected vault separation, atomic writes, positive selection,
+    primary-key uniqueness, and fiscal-year bounds.
     """
     if not master_path.exists():
         raise FileNotFoundError(f"Master dataset not found: {master_path}")
+
+    # =========================================================================
+    # D1. Validate Paths Before Any Read or Write
+    # =========================================================================
+    p_master = master_path.resolve()
+    p_dev = output_dev_path.resolve()
+    p_test = output_test_features_path.resolve()
+    p_sealed = output_sealed_outcomes_path.resolve()
+    p_receipt = receipt_path.resolve()
+    p_manifest = manifest_path.resolve()
+
+    output_map = {
+        "--out-dev": p_dev,
+        "--out-test-features": p_test,
+        "--out-sealed": p_sealed,
+        "--receipt": p_receipt,
+        "--manifest": p_manifest,
+    }
+
+    # 1. No output path may equal the master path
+    for name, p in output_map.items():
+        if p == p_master:
+            raise ValueError(f"Path collision: {name} path ({p}) equals master input dataset path ({p_master})")
+
+    # 2. No two output files may resolve to the same destination
+    items = list(output_map.items())
+    for i in range(len(items)):
+        name1, p1 = items[i]
+        for j in range(i + 1, len(items)):
+            name2, p2 = items[j]
+            if p1 == p2:
+                raise ValueError(
+                    f"Output path collision: '{name1}' and '{name2}' resolve to the same path ({p1}); "
+                    "output paths must all be distinct"
+                )
+
+    # 3. Check physical file identity via samefile where files exist
+    for name, p in output_map.items():
+        if p.exists() and p_master.exists():
+            try:
+                if p.samefile(p_master):
+                    raise ValueError(f"Physical path collision: {name} ({p}) physically resolves to master dataset ({p_master})")
+            except (OSError, ValueError) as e:
+                if "Physical path collision" in str(e):
+                    raise
+
+    for i in range(len(items)):
+        name1, p1 = items[i]
+        for j in range(i + 1, len(items)):
+            name2, p2 = items[j]
+            if p1.exists() and p2.exists():
+                try:
+                    if p1.samefile(p2):
+                        raise ValueError(
+                            f"Physical path collision: '{name1}' ({p1}) and '{name2}' ({p2}) physically resolve to the same file; "
+                            "output paths must all be distinct"
+                        )
+                except (OSError, ValueError) as e:
+                    if "Physical path collision" in str(e):
+                        raise
+
+    # 4. Check for existing outputs (prevent silent overwrite)
+    if not overwrite:
+        for name, p in output_map.items():
+            if p.exists():
+                raise FileExistsError(
+                    f"Staging output path '{name}' already exists at {p}. "
+                    "Refusing to overwrite existing staged artifact without explicit overwrite/--force authorization."
+                )
+
+    # =========================================================================
+    # D2. Distinguish Release and Sealed Vault Destinations
+    # =========================================================================
+    # Sealed outcomes must NOT be placed inside the agent-accessible release directories
+    if p_sealed.parent == p_test.parent or p_sealed.parent == p_dev.parent:
+        raise ValueError(
+            f"Protected vault destination ({p_sealed}) cannot be located inside the release feature directory ({p_test.parent}). "
+            "Sealed outcomes must be stored in an isolated protected vault."
+        )
+
+    try:
+        if p_sealed.is_relative_to(p_test.parent) or p_sealed.is_relative_to(p_dev.parent):
+            raise ValueError(
+                f"Protected vault destination ({p_sealed}) cannot be a subdirectory of the release directory. "
+                "Sealed outcomes must be stored in an isolated protected vault."
+            )
+    except AttributeError:
+        # Python < 3.9 fallback
+        pass
+
+    # Verify master dataset integrity before read
+    master_sha_before = compute_sha256(p_master)
 
     # Load master data
     df = pd.read_parquet(master_path) if master_path.suffix == ".parquet" else pd.read_csv(master_path)
@@ -144,49 +239,56 @@ def stage_holdout_data(
     if forbidden:
         raise ValueError(f"Forbidden output columns in approved allowlist: {forbidden}")
 
-    # 5. Path Distinctness Checks
-    p_dev = output_dev_path.resolve()
-    p_test = output_test_features_path.resolve()
-    p_sealed = output_sealed_outcomes_path.resolve()
-    if p_sealed == p_test or p_sealed == p_dev or p_dev == p_test:
-        raise ValueError("Output paths for dev, test features, and sealed outcomes must all be distinct")
+    # =========================================================================
+    # D3. Atomic Write Safety via Staging Temp Files
+    # =========================================================================
+    pid = os.getpid()
+    tmp_dev = p_dev.with_name(f".tmp.{p_dev.name}.{pid}")
+    tmp_test = p_test.with_name(f".tmp.{p_test.name}.{pid}")
+    tmp_sealed = p_sealed.with_name(f".tmp.{p_sealed.name}.{pid}")
+    tmp_manifest = p_manifest.with_name(f".tmp.{p_manifest.name}.{pid}")
+    tmp_receipt = p_receipt.with_name(f".tmp.{p_receipt.name}.{pid}")
 
-    # 6. Development Split (FY <= dev_max_year)
-    dev_df = df[df["fiscal_year"] <= dev_max_year].copy()
-    output_dev_path.parent.mkdir(parents=True, exist_ok=True)
-    dev_df.to_parquet(output_dev_path, index=False)
-    dev_hash = compute_sha256(output_dev_path)
+    created_tmps = []
+    try:
+        # Development Split (FY <= dev_max_year)
+        dev_df = df[df["fiscal_year"] <= dev_max_year].copy()
+        tmp_dev.parent.mkdir(parents=True, exist_ok=True)
+        dev_df.to_parquet(tmp_dev, index=False)
+        created_tmps.append(tmp_dev)
+        dev_hash = compute_sha256(tmp_dev)
 
-    # 7. Test Split (FY >= test_min_year)
-    test_raw = df[df["fiscal_year"] >= test_min_year].copy()
+        # Test Split (FY >= test_min_year)
+        test_raw = df[df["fiscal_year"] >= test_min_year].copy()
 
-    # 8. Sealed Outcomes (FY >= test_min_year)
-    outcome_cols = [c for c in test_raw.columns if c in REQUIRED_KEYS or c in FORBIDDEN_OUTCOME_COLUMNS or c in REQUIRED_TARGET_INPUTS]
-    sealed_df = test_raw[outcome_cols].copy()
-    output_sealed_outcomes_path.parent.mkdir(parents=True, exist_ok=True)
-    sealed_df.to_parquet(output_sealed_outcomes_path, index=False)
-    sealed_hash = compute_sha256(output_sealed_outcomes_path)
+        # Sealed Outcomes (FY >= test_min_year)
+        outcome_cols = [c for c in test_raw.columns if c in REQUIRED_KEYS or c in FORBIDDEN_OUTCOME_COLUMNS or c in REQUIRED_TARGET_INPUTS]
+        sealed_df = test_raw[outcome_cols].copy()
+        tmp_sealed.parent.mkdir(parents=True, exist_ok=True)
+        sealed_df.to_parquet(tmp_sealed, index=False)
+        created_tmps.append(tmp_sealed)
+        sealed_hash = compute_sha256(tmp_sealed)
 
-    # 9. Sanitized Test Features (Strict positive selection from allowlist)
-    test_features_df = test_raw[allowed].copy()
+        # Sanitized Test Features (Strict positive selection from allowlist)
+        test_features_df = test_raw[allowed].copy()
+        violations = audit_test_features_sanitization(test_features_df)
+        if violations:
+            raise ValueError(f"CRITICAL LEAKAGE: Sanitized test features contain forbidden outcome columns: {violations}")
 
-    # Sanitization assertion
-    violations = audit_test_features_sanitization(test_features_df)
-    if violations:
-        raise ValueError(f"CRITICAL LEAKAGE: Sanitized test features contain forbidden outcome columns: {violations}")
+        tmp_test.parent.mkdir(parents=True, exist_ok=True)
+        test_features_df.to_parquet(tmp_test, index=False)
+        created_tmps.append(tmp_test)
+        test_features_hash = compute_sha256(tmp_test)
 
-    output_test_features_path.parent.mkdir(parents=True, exist_ok=True)
-    test_features_df.to_parquet(output_test_features_path, index=False)
-    test_features_hash = compute_sha256(output_test_features_path)
+        # Write Checksum Manifest
+        tmp_manifest.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_manifest, "w", encoding="utf-8") as f:
+            f.write(f"{dev_hash}  {output_dev_path.name}\n")
+            f.write(f"{test_features_hash}  {output_test_features_path.name}\n")
+        created_tmps.append(tmp_manifest)
 
-    # 10. Write Checksum Manifest
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        f.write(f"{dev_hash}  {output_dev_path.name}\n")
-        f.write(f"{test_features_hash}  {output_test_features_path.name}\n")
-
-    # 11. Generate Staging Receipt
-    receipt_content = f"""# Staged Holdout Human Receipt
+        # Generate Staging Receipt
+        receipt_content = f"""# Staged Holdout Human Receipt
 Date: {pd.Timestamp.now().isoformat()}
 Steward Identity: Human Data Steward (Automated Tool Generation)
 Master Source: {master_path.name}
@@ -224,9 +326,35 @@ Master Source: {master_path.name}
 Status: STAGING_OUTPUTS_CREATED__ACCESS_ISOLATION_UNVERIFIED
 Human sign-off required after independent OS-level access-denial probe.
 """
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(receipt_path, "w", encoding="utf-8") as f:
-        f.write(receipt_content)
+        tmp_receipt.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_receipt, "w", encoding="utf-8") as f:
+            f.write(receipt_content)
+        created_tmps.append(tmp_receipt)
+
+        # Controlled Finalization: Atomic file rename
+        os.replace(tmp_dev, p_dev)
+        os.replace(tmp_test, p_test)
+        os.replace(tmp_sealed, p_sealed)
+        os.replace(tmp_manifest, p_manifest)
+        os.replace(tmp_receipt, p_receipt)
+
+    except Exception:
+        # Cleanup temporary files on failure
+        for tmp_f in created_tmps:
+            try:
+                if tmp_f.exists():
+                    tmp_f.unlink()
+            except Exception:
+                pass
+        raise
+
+    # Verify master dataset remains byte-identical
+    master_sha_after = compute_sha256(p_master)
+    if master_sha_after != master_sha_before:
+        raise RuntimeError(
+            f"CRITICAL ERROR: Master dataset SHA-256 changed during staging! "
+            f"Before: {master_sha_before}, After: {master_sha_after}"
+        )
 
     return dev_hash, test_features_hash, sealed_hash
 
@@ -241,6 +369,8 @@ if __name__ == "__main__":
     parser.add_argument("--manifest", required=True, type=Path, help="Destination for input_manifest.sha256")
     parser.add_argument("--allowlist", required=True, type=Path,
                         help="Human-approved UTF-8 text file: one canonical test feature column per line")
+    parser.add_argument("--force", action="store_true",
+                        help="Explicitly overwrite existing staging outputs")
 
     args = parser.parse_args()
     try:
@@ -255,8 +385,9 @@ if __name__ == "__main__":
                 x.strip() for x in args.allowlist.read_text(encoding="utf-8").splitlines()
                 if x.strip() and not x.strip().startswith("#")
             ],
+            overwrite=args.force,
         )
         print("Holdout staging completed successfully.")
     except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
+        print(f"STAGING FAILED: {e}", file=sys.stderr)
         sys.exit(1)

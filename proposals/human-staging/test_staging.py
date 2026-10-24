@@ -20,6 +20,7 @@ from stage_data import (
     stage_holdout_data,
     audit_test_features_sanitization,
     verify_agent_access_denial,
+    compute_sha256,
     FORBIDDEN_OUTCOME_COLUMNS
 )
 
@@ -287,3 +288,239 @@ def test_staging_rejects_missing_required_target_inputs(synthetic_master_dataset
                 "firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"
             ],
         )
+
+
+# ==============================================================================
+# Adversarial Security Tests: Master Dataset Protection & Write Safety (D4.1 - D4.12)
+# ==============================================================================
+
+def test_staging_adversarial_out_dev_equals_master(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    sha_before = compute_sha256(master)
+
+    with pytest.raises(ValueError, match="equals master input dataset path"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=master,  # COLLISION WITH MASTER
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        )
+
+    # Master file must remain byte-identical
+    assert compute_sha256(master) == sha_before
+
+
+def test_staging_adversarial_out_test_features_equals_master(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    sha_before = compute_sha256(master)
+
+    with pytest.raises(ValueError, match="equals master input dataset path"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=master,  # COLLISION WITH MASTER
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        )
+
+    assert compute_sha256(master) == sha_before
+
+
+def test_staging_adversarial_out_sealed_equals_master(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    sha_before = compute_sha256(master)
+
+    with pytest.raises(ValueError, match="equals master input dataset path"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=master,  # COLLISION WITH MASTER
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        )
+
+    assert compute_sha256(master) == sha_before
+
+
+def test_staging_adversarial_receipt_equals_master(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    sha_before = compute_sha256(master)
+
+    with pytest.raises(ValueError, match="equals master input dataset path"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=master,  # COLLISION WITH MASTER
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        )
+
+    assert compute_sha256(master) == sha_before
+
+
+def test_staging_adversarial_manifest_equals_master(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    sha_before = compute_sha256(master)
+
+    with pytest.raises(ValueError, match="equals master input dataset path"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=folder / "out" / "dev.parquet",
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=master,  # COLLISION WITH MASTER
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        )
+
+    assert compute_sha256(master) == sha_before
+
+
+def test_staging_adversarial_distinct_path_strings_resolving_to_same_destination(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    sha_before = compute_sha256(master)
+
+    p1 = folder / "out" / "dev.parquet"
+    # p2 uses dot-segments to resolve to the exact same file
+    p2 = folder / "out" / "subdir" / ".." / "dev.parquet"
+
+    with pytest.raises(ValueError, match="resolve to the same path|must all be distinct"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=p1,
+            output_test_features_path=p2,  # RESOLVES TO SAME DESTINATION
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        )
+
+    assert compute_sha256(master) == sha_before
+
+
+def test_staging_adversarial_existing_output_without_overwrite_force(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    out_dev = folder / "out" / "dev.parquet"
+    out_dev.parent.mkdir(parents=True, exist_ok=True)
+    out_dev.write_bytes(b"EXISTING_STAGED_ARTIFACT")
+
+    # Without overwrite=True, staging must raise FileExistsError
+    with pytest.raises(FileExistsError, match="already exists"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=out_dev,
+            output_test_features_path=folder / "out" / "test.parquet",
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+            overwrite=False,
+        )
+
+    # Existing file must not have been overwritten
+    assert out_dev.read_bytes() == b"EXISTING_STAGED_ARTIFACT"
+
+    # With overwrite=True, staging proceeds
+    stage_holdout_data(
+        master_path=master,
+        output_dev_path=out_dev,
+        output_test_features_path=folder / "out" / "test.parquet",
+        output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+        receipt_path=folder / "receipt.md",
+        manifest_path=folder / "manifest.sha256",
+        approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        overwrite=True,
+    )
+    assert out_dev.read_bytes() != b"EXISTING_STAGED_ARTIFACT"
+
+
+def test_staging_adversarial_vault_inside_release_directory(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    sha_before = compute_sha256(master)
+
+    release_dir = folder / "data" / "source"
+    # Placing sealed vault inside the release directory
+    bad_vault = release_dir / "sealed_outcomes.parquet"
+
+    with pytest.raises(ValueError, match="Protected vault destination"):
+        stage_holdout_data(
+            master_path=master,
+            output_dev_path=release_dir / "dev.parquet",
+            output_test_features_path=release_dir / "test.parquet",
+            output_sealed_outcomes_path=bad_vault,  # FORBIDDEN: INSIDE RELEASE DIR
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        )
+
+    assert compute_sha256(master) == sha_before
+
+
+def test_staging_failure_occurs_before_any_source_modification_and_leaves_master_intact(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    sha_before = compute_sha256(master)
+
+    out_dev = folder / "out" / "dev.parquet"
+    out_test = folder / "out" / "test.parquet"
+
+    # Trigger failure through invalid fiscal years
+    df = pd.read_parquet(master)
+    df.loc[0, "fiscal_year"] = 1990
+    invalid_master = folder / "invalid_master.parquet"
+    df.to_parquet(invalid_master, index=False)
+    invalid_sha_before = compute_sha256(invalid_master)
+
+    with pytest.raises(ValueError, match="Unexpected fiscal year range"):
+        stage_holdout_data(
+            master_path=invalid_master,
+            output_dev_path=out_dev,
+            output_test_features_path=out_test,
+            output_sealed_outcomes_path=folder / "vault" / "sealed.parquet",
+            receipt_path=folder / "receipt.md",
+            manifest_path=folder / "manifest.sha256",
+            approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+        )
+
+    # Invariants: master untouched, no output created, no temp files left
+    assert compute_sha256(invalid_master) == invalid_sha_before
+    assert not out_dev.exists()
+    assert not out_test.exists()
+    assert len(list(folder.glob(".tmp.*"))) == 0
+
+
+def test_staging_receipt_does_not_claim_os_isolation_without_evidence(synthetic_master_dataset):
+    master, folder = synthetic_master_dataset
+    out_dev = folder / "data" / "source" / "canonical_dev_source.parquet"
+    out_test = folder / "data" / "source" / "test_features_candidate.parquet"
+    out_sealed = folder / "vault" / "test_outcomes_sealed.parquet"
+    receipt = folder / "contracts" / "staged_holdout_receipt.md"
+    manifest = folder / "contracts" / "input_manifest.sha256"
+
+    stage_holdout_data(
+        master_path=master,
+        output_dev_path=out_dev,
+        output_test_features_path=out_test,
+        output_sealed_outcomes_path=out_sealed,
+        receipt_path=receipt,
+        manifest_path=manifest,
+        approved_test_feature_columns=["firm_id", "fiscal_year", "scope", "pat_pre", "total_assets_pre"],
+    )
+
+    receipt_text = receipt.read_text(encoding="utf-8")
+    # Must NOT claim pass without evidence
+    assert "- [ ] 4. OS-level access isolation verified" in receipt_text
+    assert "STAGING_OUTPUTS_CREATED__ACCESS_ISOLATION_UNVERIFIED" in receipt_text
+    assert "Human sign-off required after independent OS-level access-denial probe" in receipt_text
+
+    # Probe on readable file returns False (access NOT denied)
+    assert verify_agent_access_denial(out_sealed) is False
+
